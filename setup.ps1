@@ -125,6 +125,7 @@ function Generate-CliSafeSecret {
     ($bytes | ForEach-Object { $chars[ $_ % $chars.Length ] }) -join ''
 }
 
+
 function Protect-Secret {
     param([string]$Secret)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Secret)
@@ -221,6 +222,7 @@ $global:MeshAdminPass = $null
 $global:MeshAdminUser = 'meshadmin'
 $global:MeshAgentInstalled = $false
 
+
 try {
     Write-Section "Walidacja uprawnień"
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -252,8 +254,8 @@ try {
     Ensure-LogRotationConfig -LogPath $paths.Logs
 
     Write-Section "Konfiguracja zapory"
-    Ensure-FirewallRule -Name 'Allow-Portal-8080' -DisplayName 'Allow Portal HTTP 8080' -Action Allow -Direction Inbound -LocalPort 8080
-    Ensure-FirewallRule -Name 'Allow-Portal-8443' -DisplayName 'Allow Portal HTTPS 8443' -Action Allow -Direction Inbound -LocalPort 8443
+    Ensure-FirewallRule -Name 'Allow-Portal-8080' -DisplayName 'Allow Portal HTTP 8080' -Action Allow -Direction Inbound -LocalPort 8080    Ensure-FirewallRule -Name 'Allow-Portal-8443' -DisplayName 'Allow Portal HTTPS 8443' -Action Allow -Direction Inbound -LocalPort 8443
+
     Ensure-FirewallRule -Name 'Allow-Minecraft-11131' -DisplayName 'Allow Minecraft 11131' -Action Allow -Direction Inbound -LocalPort 11131
     Ensure-FirewallRule -Name 'Allow-BlueMap-11141' -DisplayName 'Allow BlueMap 11141' -Action Allow -Direction Inbound -LocalPort 11141
     Ensure-FirewallRule -Name 'Block-RDP-3389' -DisplayName 'Block RDP 3389' -Action Block -Direction Inbound -LocalPort 3389
@@ -269,6 +271,7 @@ try {
     auto_https off
     admin off
 }
+
 
 :8080 {
     encode gzip
@@ -319,6 +322,7 @@ https://:8443 {
 
     $caddyLog = Join-Path $paths.Logs 'caddy-service.log'
     Ensure-NssmService -ServiceName 'CaddyReverseProxy' -DisplayName 'Caddy Reverse Proxy' -Executable $caddyExe -Arguments "run --config `"$caddyFile`"" -WorkingDirectory $paths.Caddy -StdOutLog $caddyLog -StdErrLog $caddyLog
+
 
     Write-Section "Node.js + MeshCentral"
     $nodeRoot = Join-Path $paths.Bin 'node'
@@ -447,6 +451,7 @@ https://:8443 {
         }
     }
 
+
     Write-Section "PHP 8.x + środowisko sklepu"
     $phpExe = Join-Path $paths.PHP 'php.exe'
     if (-not (Test-Path -LiteralPath $phpExe)) {
@@ -513,6 +518,7 @@ return [
     else {
         $adminPass = $null
         $secretsData.Admin.Username = $adminUser
+
     }
 
     $rconClient = @'
@@ -608,6 +614,7 @@ catch {
     Write-DeliveryLog "Błąd podczas dostarczania nagrody dla $Player: $_"
     throw
 }
+
 '@
     $deliverPath = Join-Path $paths.ShopBin 'deliver.ps1'
     $deliverScript | Out-File -FilePath $deliverPath -Encoding UTF8
@@ -665,6 +672,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $message = 'Podaj nick gracza i produkt.';
     }
 }
+
 ?>
 <!doctype html>
 <html lang="pl">
@@ -709,6 +717,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <button type="submit">Generuj zamówienie sandbox</button>
 </form>
 <p>Webhook: <code>/shop/webhook.php</code>. Skonfiguruj go w panelu PSP.</p>
+
 </body>
 </html>
 '@
@@ -859,6 +868,7 @@ if ($recognizedPaid) {
 }
 
 shop_log('Webhook przyjęty, status oczekujący: ' . $status . ' (zamówienie ' . $reference . ')', $logFile);
+
 http_response_code(202);
 echo json_encode(['status' => 'ACCEPTED']);
 '@
@@ -875,6 +885,7 @@ $user = $_SERVER['PHP_AUTH_USER'] ?? '';
 $pass = $_SERVER['PHP_AUTH_PW'] ?? '';
 $hash = base64_encode(hash('sha256', $pass, true));
 if (!$user || $user !== ($admin['Username'] ?? '') || $hash !== ($admin['PasswordHash'] ?? '')) {
+
     header('WWW-Authenticate: Basic realm="Shop Admin"');
     header('HTTP/1.0 401 Unauthorized');
     echo 'Unauthorized';
@@ -930,6 +941,7 @@ $products = $db->query('SELECT id, name, price FROM products ORDER BY id');
 </div>
 </body>
 </html>
+
 '@
     $adminPath = Join-Path $paths.ShopAdmin 'index.php'
     $adminPhp | Out-File -FilePath $adminPath -Encoding UTF8
@@ -941,6 +953,7 @@ $products = $db->query('SELECT id, name, price FROM products ORDER BY id');
 3. Tunele Playit: 443→8443 (HTTPS Caddy), 11131→11131 (Minecraft), 11141→11141 (BlueMap).
 4. Logi sklepu znajdziesz w C:\Infra\logs\shop.log oraz C:\Infra\logs\shop-delivery.log.
 5. W przypadku problemów sprawdź panel admina pod /shop/admin i logi systemowe.
+
 '@
     $readmePath = Join-Path $paths.Shop 'README-FIRST.txt'
     $readme | Out-File -FilePath $readmePath -Encoding UTF8
@@ -999,6 +1012,7 @@ if ($changeRcon -match '^[TtYy]') {
 
 $data | ConvertTo-Json -Depth 6 | Out-File -FilePath $secretsPath -Encoding UTF8
 Write-Host "Sekrety PSP zapisane." -ForegroundColor Green
+
 '@
     $configurePath = Join-Path $paths.Shop 'configure-psp.ps1'
     $configurePsp | Out-File -FilePath $configurePath -Encoding UTF8
@@ -1006,6 +1020,7 @@ Write-Host "Sekrety PSP zapisane." -ForegroundColor Green
     Write-Section "Inicjalizacja bazy SQLite"
     $sqlitePath = Join-Path $paths.ShopData 'shop.sqlite'
     $schema = @'
+
 CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -1025,13 +1040,13 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at TEXT,
     updated_at TEXT,
     FOREIGN KEY(product_id) REFERENCES products(id)
+
 );
 CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message TEXT,
     created_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_orders_external_id ON orders(external_id);
+);CREATE INDEX IF NOT EXISTS idx_orders_external_id ON orders(external_id);
 INSERT OR IGNORE INTO products (id, name, price, command) VALUES (1, 'Diamentowy miecz', 1.00, '/give %player% diamond_sword 1');
 INSERT OR IGNORE INTO products (id, name, price, command) VALUES (2, 'Elytra', 15.00, '/give %player% elytra 1');
 '@
@@ -1045,6 +1060,7 @@ INSERT OR IGNORE INTO products (id, name, price, command) VALUES (2, 'Elytra', 1
     Ensure-NssmService -ServiceName 'ShopPhpService' -DisplayName 'Minecraft Shop Service' -Executable $phpExe -Arguments "-S 127.0.0.1:8081 -t `"$($paths.ShopPublic)`"" -WorkingDirectory $paths.Shop -StdOutLog $shopLog -StdErrLog $shopLog
     $legacyTask = Get-ScheduledTask -TaskName 'ShopService@Startup' -ErrorAction SilentlyContinue
     if ($legacyTask) { Unregister-ScheduledTask -TaskName 'ShopService@Startup' -Confirm:$false }
+
 
     Write-Section "Konfiguracja RCON serwera Minecraft"
     $serverProps = 'C:\SERWER\server.properties'
@@ -1084,6 +1100,7 @@ INSERT OR IGNORE INTO products (id, name, price, command) VALUES (2, 'Elytra', 1
     Save-Json -Path $secretsPath -Data $secretsData
     icacls $secretsPath /inheritance:r | Out-Null
     icacls $secretsPath /grant:r 'Administrators:F' | Out-Null
+
 
     Write-Section "Autostart serwera Minecraft"
     $startBat = 'C:\SERWER\start-server.bat'
@@ -1127,13 +1144,14 @@ cd /d "C:\SERWER"
         RconPassword = if ($rconPassword) { $rconPassword } else { '<bez zmian>' }
         MeshCentral = @{ Username = $global:MeshAdminUser; Password = if ($global:MeshAdminPass) { $global:MeshAdminPass } else { '<niezmienione>' } }
         PSPProvider = $secretsData.PSP.Provider
+
     }
     Save-Json -Path $secretFile -Data $secrets
     icacls $secretFile /inheritance:r | Out-Null
     icacls $secretFile /grant:r 'Administrators:F' | Out-Null
 
-    Write-Section "Uruchamianie usług"
-    $services = @('CaddyReverseProxy','MeshCentral','ShopPhpService','Mesh Agent') | ForEach-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue }
+    Write-Section "Uruchamianie usług"    $services = @('CaddyReverseProxy','MeshCentral','ShopPhpService','Mesh Agent') | ForEach-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue }
+
     foreach ($svc in $services) {
         if ($svc -and $svc.Status -ne 'Running') { Start-Service -Name $svc.Name }
     }
@@ -1142,11 +1160,11 @@ cd /d "C:\SERWER"
         Write-Warning 'MeshAgent nie został zainstalowany automatycznie. Pobierz instalator z http://localhost:8080/desk po zalogowaniu.'
     }
 
+
     Write-Section "Status końcowy"
     $status = [ordered]@{
         Caddy = (Get-Service -Name 'CaddyReverseProxy' -ErrorAction SilentlyContinue)?.Status
-        MeshCentral = (Get-Service -Name 'MeshCentral' -ErrorAction SilentlyContinue)?.Status
-        ShopService = (Get-Service -Name 'ShopPhpService' -ErrorAction SilentlyContinue)?.Status
+        MeshCentral = (Get-Service -Name 'MeshCentral' -ErrorAction SilentlyContinue)?.Statu        ShopService = (Get-Service -Name 'ShopPhpService' -ErrorAction SilentlyContinue)?.Status
         MeshAgent = (Get-Service -Name 'Mesh Agent' -ErrorAction SilentlyContinue)?.Status
         Minecraft = (Get-ScheduledTask -TaskName 'Minecraft@Startup' -ErrorAction SilentlyContinue) ? 'ScheduledTask'
     }
