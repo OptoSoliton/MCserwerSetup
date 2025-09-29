@@ -109,30 +109,6 @@ function Ensure-Service {
     }
 }
 
-function Ensure-PathEntry {
-    param(
-        [Parameter(Mandatory)][string]$Entry
-    )
-
-    $normalized = $Entry.TrimEnd(';')
-    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $pattern = "(?i)(^|;){0}(;|$)" -f [Regex]::Escape($normalized)
-
-    if ([string]::IsNullOrEmpty($machinePath)) {
-        [Environment]::SetEnvironmentVariable('Path', $normalized, 'Machine')
-    }
-    elseif ($machinePath -notmatch $pattern) {
-        [Environment]::SetEnvironmentVariable('Path', "$normalized;$machinePath", 'Machine')
-    }
-
-    $processPath = $env:Path
-    if ([string]::IsNullOrEmpty($processPath)) {
-        $env:Path = $normalized
-    }
-    elseif ($processPath -notmatch $pattern) {
-        $env:Path = "$normalized;$processPath"
-    }
-}
 
 function Generate-Secret {
     param([int]$Length = 32)
@@ -165,167 +141,6 @@ function Save-Json {
     $json | Out-File -FilePath $Path -Encoding UTF8
 }
 
-function Ensure-Nssm {
-    param([string]$DestinationRoot)
-
-    $nssmDir = Join-Path $DestinationRoot 'nssm'
-    $nssmExe = Join-Path $nssmDir 'nssm.exe'
-    if (Test-Path -LiteralPath $nssmExe) {
-        return $nssmExe
-    }
-
-    Write-Host "[INFO] Pobieram NSSM" -ForegroundColor Yellow
-    $zipPath = Join-Path ([System.IO.Path]::GetTempPath()) 'nssm.zip'
-    Invoke-WebRequest -Uri 'https://nssm.cc/release/nssm-2.24.zip' -OutFile $zipPath -UseBasicParsing
-    try {
-        $extractPath = Join-Path ([System.IO.Path]::GetTempPath()) 'nssm_extract'
-        if (Test-Path $extractPath) { Remove-Item -Path $extractPath -Recurse -Force }
-        Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-        $sourceExe = Join-Path $extractPath 'nssm-2.24\win64\nssm.exe'
-        if (-not (Test-Path -LiteralPath $sourceExe)) {
-            throw 'Nie znaleziono nssm.exe w archiwum.'
-        }
-        Ensure-Directory $nssmDir
-        Copy-Item -Path $sourceExe -Destination $nssmExe -Force
-    }
-    finally {
-        Remove-Item -LiteralPath $zipPath -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $extractPath -ErrorAction SilentlyContinue
-    }
-
-    return $nssmExe
-}
-
-function Install-NssmService {
-    param(
-        [Parameter(Mandatory)][string]$NssmExe,
-        [Parameter(Mandatory)][string]$ServiceName,
-        [Parameter(Mandatory)][string]$DisplayName,
-        [Parameter(Mandatory)][string]$Executable,
-        [string]$Arguments,
-        [string]$WorkingDirectory,
-        [string]$StdOut,
-        [string]$StdErr
-    )
-
-    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if (-not $service) {
-        Write-Host "[SVC] Rejestruję usługę $DisplayName (NSSM)" -ForegroundColor Yellow
-        $installArgs = @('install', $ServiceName, $Executable)
-        if ($Arguments) { $installArgs += $Arguments }
-        & $NssmExe @installArgs | Out-Null
-    }
-    elseif ($service.Status -eq 'Running') {
-        & $NssmExe stop $ServiceName | Out-Null
-    }
-
-    if ($Arguments) { & $NssmExe set $ServiceName AppParameters $Arguments | Out-Null }
-    if ($WorkingDirectory) { & $NssmExe set $ServiceName AppDirectory $WorkingDirectory | Out-Null }
-    if ($StdOut) { & $NssmExe set $ServiceName AppStdout $StdOut | Out-Null }
-    if ($StdErr) { & $NssmExe set $ServiceName AppStderr $StdErr | Out-Null }
-    & $NssmExe set $ServiceName AppRotateFiles 1 | Out-Null
-    & $NssmExe set $ServiceName AppRotateSeconds 86400 | Out-Null
-    & $NssmExe set $ServiceName AppRotateBytes 10485760 | Out-Null
-    & $NssmExe set $ServiceName Start SERVICE_AUTO_START | Out-Null
-    & $NssmExe set $ServiceName AppRestartDelay 5000 | Out-Null
-    & $NssmExe set $ServiceName DisplayName $DisplayName | Out-Null
-
-    if (-not $service) {
-        & $NssmExe set $ServiceName Description $DisplayName | Out-Null
-    }
-
-    & $NssmExe start $ServiceName | Out-Null
-}
-
-function Ensure-Java21 {
-    param([string]$InfraBin)
-
-    $candidatePaths = New-Object System.Collections.Generic.List[string]
-    if ($env:JAVA_HOME) {
-        $candidatePaths.Add((Join-Path $env:JAVA_HOME 'bin\java.exe'))
-    }
-
-    $registryPaths = @(
-        'HKLM:\SOFTWARE\JavaSoft\JDK',
-        'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\JDK',
-        'HKLM:\SOFTWARE\Microsoft\JDK'
-    )
-    foreach ($regPath in $registryPaths) {
-        try {
-            Get-ChildItem -Path $regPath -ErrorAction Stop | ForEach-Object {
-                $home = (Get-ItemProperty -Path $_.PSPath -Name JavaHome -ErrorAction SilentlyContinue).JavaHome
-                if ($home) {
-                    $candidatePaths.Add((Join-Path $home 'bin\java.exe'))
-                }
-            }
-        }
-        catch {
-        }
-    }
-
-    $programDirs = @('C:\Program Files\Microsoft', 'C:\Program Files', 'C:\Program Files (x86)', (Join-Path $InfraBin 'java'))
-    foreach ($dir in $programDirs) {
-        if (Test-Path -LiteralPath $dir) {
-            Get-ChildItem -Path $dir -Directory -Filter 'jdk-21*' -ErrorAction SilentlyContinue | ForEach-Object {
-                $candidatePaths.Add((Join-Path $_.FullName 'bin\java.exe'))
-            }
-        }
-    }
-
-    foreach ($path in $candidatePaths | Select-Object -Unique) {
-        if (Test-Path -LiteralPath $path) {
-            Write-Host "[JAVA] Znaleziono Java 21: $path" -ForegroundColor DarkGreen
-            return $path
-        }
-    }
-
-    Write-Host "[JAVA] Brak JDK 21 — instaluję Microsoft OpenJDK" -ForegroundColor Yellow
-    $javaRoot = Join-Path $InfraBin 'java'
-    Ensure-Directory $javaRoot
-    $downloadUrl = 'https://aka.ms/download-jdk/microsoft-jdk-21.0.5-windows-x64.zip'
-    $zipPath = Join-Path ([System.IO.Path]::GetTempPath()) 'jdk21.zip'
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
-    try {
-        Expand-Archive -Path $zipPath -DestinationPath $javaRoot -Force
-        $jdkFolder = Get-ChildItem -Path $javaRoot -Directory -Filter 'jdk-21*' | Sort-Object Name -Descending | Select-Object -First 1
-        if (-not $jdkFolder) {
-            throw 'Nie udało się rozpakować JDK.'
-        }
-        $javaExe = Join-Path $jdkFolder.FullName 'bin\java.exe'
-        [Environment]::SetEnvironmentVariable('JAVA_HOME', $jdkFolder.FullName, 'Machine')
-        Ensure-PathEntry (Join-Path $jdkFolder.FullName 'bin')
-        return $javaExe
-    }
-    finally {
-        Remove-Item -LiteralPath $zipPath -ErrorAction SilentlyContinue
-    }
-}
-
-function Test-JavaServer {
-    param(
-        [Parameter(Mandatory)][string]$JavaExe,
-        [Parameter(Mandatory)][string]$ServerJar
-    )
-
-    if (-not (Test-Path -LiteralPath $ServerJar)) {
-        throw "Nie znaleziono pliku serwera: $ServerJar"
-    }
-
-    Write-Host "[JAVA] Weryfikuję uruchomienie server.jar" -ForegroundColor Yellow
-    $commonArgs = @('-Xms128M','-XX:MaxRAMPercentage=95.0','-Dterminal.jline=false','-Dterminal.ansi=true','-jar',$ServerJar)
-    $attempts = @('--version','--help')
-    $lastExit = $null
-    foreach ($suffix in $attempts) {
-        $process = Start-Process -FilePath $JavaExe -ArgumentList ($commonArgs + $suffix) -NoNewWindow -PassThru -Wait -ErrorAction SilentlyContinue
-        if ($process -and $process.ExitCode -eq 0) {
-            Write-Host "[JAVA] server.jar odpowiada poprawnie." -ForegroundColor DarkGreen
-            return
-        }
-        $lastExit = $process?.ExitCode
-        Write-Host "[JAVA] Próba walidacji z argumentem $suffix nie powiodła się (kod: $lastExit)." -ForegroundColor Yellow
-    }
-    throw "server.jar nie uruchomił się poprawnie (ostatni kod wyjścia: $lastExit)"
-}
 
 function Ensure-LogRotationConfig {
     param([string]$LogPath)
@@ -405,10 +220,127 @@ function Write-LogMessage {
     "$timestamp`t$Message" | Out-File -FilePath $Path -Encoding UTF8 -Append
 }
 
+function Invoke-LocalHttps {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [int]$TimeoutSeconds = 15
+    )
+
+    $previous = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    try {
+        Invoke-WebRequest -Uri $Uri -UseBasicParsing -TimeoutSec $TimeoutSeconds
+    }
+    finally {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $previous
+    }
+}
+
+function Mask-Secret {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) { return '<brak>' }
+    if ($Value.Length -le 4) { return ('*' * $Value.Length) }
+    return ('*' * ($Value.Length - 4)) + $Value.Substring($Value.Length - 4)
+}
+
+function Test-JavaEnvironment {
+    param(
+        [string]$JavaCommand = 'java',
+        [string]$ServerDirectory = 'C:\\SERWER'
+    )
+
+    $javaOk = $false
+    try {
+        $null = & $JavaCommand -version 2>&1
+        if ($LASTEXITCODE -eq 0) { $javaOk = $true }
+    }
+    catch {
+        $javaOk = $false
+    }
+
+    $jarPath = Join-Path $ServerDirectory 'server.jar'
+    $jarExists = Test-Path -LiteralPath $jarPath
+
+    return [ordered]@{
+        JavaExecutable = $JavaCommand
+        JavaAccessible = $javaOk
+        ServerJarExists = $jarExists
+        ServerJarPath = $jarPath
+    }
+}
+
+function New-CaddyConfig {
+    param(
+        [ValidateSet('path','host')]
+        [string]$MeshMode = 'path',
+        [Parameter(Mandatory)][string]$ShopRoot
+    )
+
+    $config = @"
+{
+    admin off
+}
+
+https://:8443 {
+    tls internal
+    encode gzip
+
+    @desk path /desk /desk/*
+    handle @desk {
+        header Cache-Control "no-store"
+        reverse_proxy https://127.0.0.1:4430 {
+            header_up Host {http.request.host}
+            header_up X-Forwarded-Host {http.request.host}
+            header_up X-Forwarded-Proto {http.request.scheme}
+            transport http {
+                tls
+                tls_insecure_skip_verify
+            }
+        }
+    }
+
+    handle_path /shop* {
+        root * $ShopRoot
+        php_fastcgi 127.0.0.1:9000
+        file_server
+    }
+
+    handle_path /map* {
+        reverse_proxy 127.0.0.1:11141
+    }
+
+    handle / {
+        respond "OK" 200
+    }
+}
+"@
+
+    if ($MeshMode -eq 'host') {
+        $config += @"
+
+https://desk.localhost:8443 {
+    tls internal
+    encode gzip
+    header Cache-Control "no-store"
+    reverse_proxy https://127.0.0.1:4430 {
+        header_up Host {http.request.host}
+        header_up X-Forwarded-Host {http.request.host}
+        header_up X-Forwarded-Proto {http.request.scheme}
+        transport http {
+            tls
+            tls_insecure_skip_verify
+        }
+    }
+}
+"@
+    }
+
+    return $config
+}
+
 $global:MeshAdminPass = $null
 $global:MeshAdminUser = 'meshadmin'
 $global:MeshAgentInstalled = $false
-
 
 try {
     Write-Section "Walidacja uprawnień"
@@ -440,15 +372,19 @@ try {
 
     Ensure-LogRotationConfig -LogPath $paths.Logs
 
-    $nssmExe = Ensure-Nssm -DestinationRoot $paths.Bin
-    $javaExe = Ensure-Java21 -InfraBin $paths.Bin
+    Write-Section "Weryfikacja środowiska Java/Minecraft"
+    $javaStatus = Test-JavaEnvironment -JavaCommand 'java' -ServerDirectory 'C:\\SERWER'
+    if (-not $javaStatus.JavaAccessible) {
+        Write-Warning "Polecenie 'java -version' zakończyło się niepowodzeniem. Zweryfikuj instalację JDK." 
+    }
+    else {
+        Write-Host "[OK] java -version zwróciło kod 0" -ForegroundColor DarkGreen
+    }
+    if (-not $javaStatus.ServerJarExists) {
+        Write-Warning "Nie znaleziono pliku $($javaStatus.ServerJarPath). Upewnij się, że server.jar jest dostępny."
+    }
 
     Write-Section "Konfiguracja zapory"
-    $legacyPortalRule = Get-NetFirewallRule -DisplayName 'Allow Portal HTTP 8080' -ErrorAction SilentlyContinue
-    if ($legacyPortalRule) {
-        Write-Host "[FW] Usuwam przestarzałą regułę 8080" -ForegroundColor Yellow
-        Remove-NetFirewallRule -DisplayName 'Allow Portal HTTP 8080'
-    }
     Ensure-FirewallRule -Name 'Allow-Portal-8443' -DisplayName 'Allow Portal HTTPS 8443' -Action Allow -Direction Inbound -LocalPort 8443
 
     Ensure-FirewallRule -Name 'Allow-Minecraft-11131' -DisplayName 'Allow Minecraft 11131' -Action Allow -Direction Inbound -LocalPort 11131
@@ -461,40 +397,40 @@ try {
     Download-IfMissing -Uri $caddyUrl -Destination $caddyExe -Description 'Pobieranie Caddy (Windows)'
 
     $caddyFile = Join-Path $paths.Caddy 'Caddyfile'
-    $caddyConfig = @'
-:8443 {
-    tls internal
+    $meshRoutingMode = 'path'
+    $caddyConfig = New-CaddyConfig -MeshMode $meshRoutingMode -ShopRoot $paths.ShopPublic
+    $caddyConfig | Out-File -FilePath $caddyFile -Encoding UTF8
 
-    encode gzip
+    $caddyLog = Join-Path $paths.Logs 'caddy-service.log'
+    Ensure-NssmService -ServiceName 'CaddyReverseProxy' -DisplayName 'Caddy Reverse Proxy' -Executable $caddyExe -Arguments "run --config `"$caddyFile`"" -WorkingDirectory $paths.Caddy -StdOutLog $caddyLog -StdErrLog $caddyLog
 
-    handle_path /desk* {
-        header Cache-Control "no-store"
-        reverse_proxy https://127.0.0.1:4430 {
-            transport http {
-                tls_insecure_skip_verify
-            }
-            header_up Host {host}
-        }
+    Start-Sleep -Seconds 5
 
+    $deskCheck = $null
+    $deskScriptCheck = $null
+    try {
+        $deskCheck = Invoke-LocalHttps -Uri 'https://localhost:8443/desk/'
+    }
+    catch {
+        $deskCheck = $_
+    }
+    try {
+        $deskScriptCheck = Invoke-LocalHttps -Uri 'https://localhost:8443/desk/scripts/common.js'
+    }
+    catch {
+        $deskScriptCheck = $_
     }
 
-    handle_path /map* {
-        reverse_proxy http://127.0.0.1:11141
+    if (-not ($deskCheck -is [Microsoft.PowerShell.Commands.BasicHtmlWebResponseObject] -and $deskCheck.StatusCode -eq 200 -and $deskScriptCheck -is [Microsoft.PowerShell.Commands.BasicHtmlWebResponseObject] -and $deskScriptCheck.StatusCode -eq 200)) {
+        Write-Warning 'Przekierowanie MeshCentral po ścieżce /desk nie działa – przełączam na routing host-based (desk.localhost).'
+        $meshRoutingMode = 'host'
+        $caddyConfig = New-CaddyConfig -MeshMode $meshRoutingMode -ShopRoot $paths.ShopPublic
+        $caddyConfig | Out-File -FilePath $caddyFile -Encoding UTF8
+        & (Ensure-Nssm -BinPath $paths.Bin) restart CaddyReverseProxy | Out-Null
+        Start-Sleep -Seconds 5
+        try { $deskCheck = Invoke-LocalHttps -Uri 'https://localhost:8443/desk/' } catch { $deskCheck = $_ }
+        try { $deskScriptCheck = Invoke-LocalHttps -Uri 'https://localhost:8443/desk/scripts/common.js' } catch { $deskScriptCheck = $_ }
     }
-
-    handle_path /shop* {
-        root * C:/Infra/shop/public
-        php_fastcgi 127.0.0.1:9000
-        file_server
-    }
-
-    handle / {
-        respond "OK" 200
-    }
-}
-
-    $caddyLog = Join-Path $paths.Logs 'caddy.log'
-    Install-NssmService -NssmExe $nssmExe -ServiceName 'CaddyReverseProxy' -DisplayName 'Caddy Reverse Proxy' -Executable $caddyExe -Arguments "run --config `"$caddyFile`"" -WorkingDirectory $paths.Caddy -StdOut $caddyLog -StdErr $caddyLog
 
 
     Write-Section "Node.js + MeshCentral"
@@ -509,16 +445,8 @@ try {
         Remove-Item -Path $nodeZip -Force
         $extracted = Join-Path $paths.Bin 'node-v18.20.2-win-x64'
         if (Test-Path $extracted) {
-            if (Test-Path $nodeRoot) {
-                $timestamp = Get-Date -Format 'yyyyMMddHHmmss'
-                $backupCandidate = "$nodeRoot.backup.$timestamp"
-                while (Test-Path -LiteralPath $backupCandidate) {
-                    $timestamp = Get-Date -Format 'yyyyMMddHHmmssff'
-                    $backupCandidate = "$nodeRoot.backup.$timestamp"
-                }
-                Move-Item -Path $nodeRoot -Destination $backupCandidate -Force
-                Write-Host "[SAFE] Istniejąca kopia Node.js przeniesiona do $backupCandidate" -ForegroundColor Yellow
-            }
+            if (Test-Path $nodeRoot) { Remove-Item -Recurse -Force $nodeRoot }
+
             Rename-Item -Path $extracted -NewName 'node'
         }
     }
@@ -526,7 +454,8 @@ try {
         Write-Host "[OK] Node.js już obecny" -ForegroundColor DarkGreen
     }
 
-    Ensure-PathEntry $nodeRoot
+    $env:Path = $nodeRoot + ';' + $env:Path
+    [Environment]::SetEnvironmentVariable('Path', $nodeRoot + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine'), 'Machine')
 
     Ensure-Directory (Join-Path $paths.Mesh 'meshcentral-data')
     Ensure-Directory (Join-Path $paths.Mesh 'meshcentral-files')
@@ -555,7 +484,6 @@ try {
             AllowLoginToken = $false
             UserSessionIdleTimeout = 0
             WebRTC = $true
-            AllowFraming = $true
         }
         domains = @{
             '' = @{
@@ -572,9 +500,22 @@ try {
     $meshConfigJson | Out-File -FilePath $meshConfigPath -Encoding UTF8
 
     $meshModule = Join-Path $paths.Mesh 'node_modules\meshcentral'
-    $meshLog = Join-Path $paths.Logs 'meshcentral.log'
-    $meshArgs = '"' + $meshModule + '" --config "' + $meshConfigPath + '"'
-    Install-NssmService -NssmExe $nssmExe -ServiceName 'MeshCentral' -DisplayName 'MeshCentral Server' -Executable $nodeExe -Arguments $meshArgs -WorkingDirectory $paths.Mesh -StdOut $meshLog -StdErr $meshLog
+    if (Test-Path $meshModule) {
+        Write-Host "[INFO] Rejestruję usługę MeshCentral" -ForegroundColor Yellow
+        & $nodeExe $meshModule --install --installPath $paths.Mesh | Out-Null
+    }
+
+    $meshService = Get-Service -Name 'MeshCentral' -ErrorAction SilentlyContinue
+    if ($meshService) {
+        if ($meshService.Status -ne 'Running') { Start-Service -Name 'MeshCentral' }
+    }
+    else {
+        Write-Host "[WARN] Nie znaleziono usługi MeshCentral. Tworzę zadanie." -ForegroundColor Yellow
+        $meshAction = New-ScheduledTaskAction -Execute $nodeExe -Argument "`"$meshModule`" --config `"$meshConfigPath`""
+        $meshTrigger = New-ScheduledTaskTrigger -AtStartup
+        Ensure-ScheduledTask -TaskName 'MeshCentral@Startup' -Action $meshAction -Trigger $meshTrigger -Description 'MeshCentral serwer zdalnego pulpitu'
+    }
+
 
     Start-Sleep -Seconds 5
 
@@ -621,43 +562,48 @@ try {
         }
     }
 
-
     Write-Section "PHP 8.x + środowisko sklepu"
     $phpExe = Join-Path $paths.PHP 'php.exe'
     if (-not (Test-Path -LiteralPath $phpExe)) {
         Write-Host "[INFO] Pobieram PHP 8.3 NTS" -ForegroundColor Yellow
         $phpZip = Join-Path ([System.IO.Path]::GetTempPath()) 'php.zip'
         Invoke-WebRequest -Uri 'https://windows.php.net/downloads/releases/php-8.3.3-nts-Win32-vs16-x64.zip' -OutFile $phpZip -UseBasicParsing
-        $phpExtract = Join-Path ([System.IO.Path]::GetTempPath()) 'php_extract'
-        if (Test-Path $phpExtract) { Remove-Item -Path $phpExtract -Recurse -Force }
-        Expand-Archive -Path $phpZip -DestinationPath $phpExtract -Force
-        $extractedRoot = Get-ChildItem -Path $phpExtract | Select-Object -First 1
-        $sourcePath = if ($extractedRoot -and $extractedRoot.PSIsContainer) { $extractedRoot.FullName } else { $phpExtract }
-        Get-ChildItem -Path $sourcePath | ForEach-Object { Move-Item -Path $_.FullName -Destination $paths.PHP -Force }
-        Remove-Item -Path $phpExtract -Recurse -Force
+        Expand-Archive -Path $phpZip -DestinationPath $paths.PHP -Force
+
         Remove-Item -Path $phpZip -Force
     }
     else {
         Write-Host "[OK] PHP już obecny" -ForegroundColor DarkGreen
     }
 
-    Ensure-PathEntry $paths.PHP
-
-    $phpCgiExe = Join-Path $paths.PHP 'php-cgi.exe'
-    if (-not (Test-Path -LiteralPath $phpCgiExe)) {
-        throw "Nie znaleziono php-cgi.exe w $($paths.PHP)"
-    }
+    $env:Path = $paths.PHP + ';' + $env:Path
+    [Environment]::SetEnvironmentVariable('Path', $paths.PHP + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine'), 'Machine')
 
     $phpIni = Join-Path $paths.PHP 'php.ini'
     if (-not (Test-Path -LiteralPath $phpIni)) {
-        $phpIniSource = Join-Path $paths.PHP 'php.ini-production'
-        if (Test-Path -LiteralPath $phpIniSource) {
-            Copy-Item -Path $phpIniSource -Destination $phpIni -Force
+        $iniSource = @('php.ini-production','php.ini-development') | ForEach-Object { Join-Path $paths.PHP $_ } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ($iniSource) {
+            Copy-Item -Path $iniSource -Destination $phpIni -Force
         }
         else {
-            '' | Out-File -FilePath $phpIni -Encoding UTF8
+            New-Item -Path $phpIni -ItemType File -Force | Out-Null
         }
     }
+    $iniContent = Get-Content -Path $phpIni
+    $iniContent = $iniContent | ForEach-Object {
+        if ($_ -match '^\s*;\s*extension_dir\s*=') { 'extension_dir = "ext"' }
+        elseif ($_ -match '^\s*extension_dir\s*=') { 'extension_dir = "ext"' }
+        elseif ($_ -match '^\s*;\s*extension\s*=\s*sqlite3') { 'extension = sqlite3' }
+        elseif ($_ -match '^\s*;\s*extension\s*=\s*pdo_sqlite') { 'extension = pdo_sqlite' }
+        elseif ($_ -match '^\s*extension\s*=\s*sqlite3') { 'extension = sqlite3' }
+        elseif ($_ -match '^\s*extension\s*=\s*pdo_sqlite') { 'extension = pdo_sqlite' }
+        else { $_ }
+    }
+    if ($iniContent -notmatch 'extension_dir\s*=\s*"ext"') { $iniContent += 'extension_dir = "ext"' }
+    if ($iniContent -notmatch 'extension\s*=\s*sqlite3') { $iniContent += 'extension = sqlite3' }
+    if ($iniContent -notmatch 'extension\s*=\s*pdo_sqlite') { $iniContent += 'extension = pdo_sqlite' }
+    $iniContent | Set-Content -Path $phpIni -Encoding UTF8
+
 
     $configPhp = @'
 <?php
@@ -709,7 +655,6 @@ return [
     else {
         $adminPass = $null
         $secretsData.Admin.Username = $adminUser
-
     }
 
     $rconClient = @'
@@ -805,7 +750,6 @@ catch {
     Write-DeliveryLog "Błąd podczas dostarczania nagrody dla $Player: $_"
     throw
 }
-
 '@
     $deliverPath = Join-Path $paths.ShopBin 'deliver.ps1'
     $deliverScript | Out-File -FilePath $deliverPath -Encoding UTF8
@@ -863,7 +807,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $message = 'Podaj nick gracza i produkt.';
     }
 }
-
 ?>
 <!doctype html>
 <html lang="pl">
@@ -908,7 +851,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <button type="submit">Generuj zamówienie sandbox</button>
 </form>
 <p>Webhook: <code>/shop/webhook.php</code>. Skonfiguruj go w panelu PSP.</p>
-
 </body>
 </html>
 '@
@@ -1059,7 +1001,6 @@ if ($recognizedPaid) {
 }
 
 shop_log('Webhook przyjęty, status oczekujący: ' . $status . ' (zamówienie ' . $reference . ')', $logFile);
-
 http_response_code(202);
 echo json_encode(['status' => 'ACCEPTED']);
 '@
@@ -1076,7 +1017,6 @@ $user = $_SERVER['PHP_AUTH_USER'] ?? '';
 $pass = $_SERVER['PHP_AUTH_PW'] ?? '';
 $hash = base64_encode(hash('sha256', $pass, true));
 if (!$user || $user !== ($admin['Username'] ?? '') || $hash !== ($admin['PasswordHash'] ?? '')) {
-
     header('WWW-Authenticate: Basic realm="Shop Admin"');
     header('HTTP/1.0 401 Unauthorized');
     echo 'Unauthorized';
@@ -1203,7 +1143,6 @@ if ($changeRcon -match '^[TtYy]') {
 
 $data | ConvertTo-Json -Depth 6 | Out-File -FilePath $secretsPath -Encoding UTF8
 Write-Host "Sekrety PSP zapisane." -ForegroundColor Green
-
 '@
     $configurePath = Join-Path $paths.Shop 'configure-psp.ps1'
     $configurePsp | Out-File -FilePath $configurePath -Encoding UTF8
@@ -1211,7 +1150,6 @@ Write-Host "Sekrety PSP zapisane." -ForegroundColor Green
     Write-Section "Inicjalizacja bazy SQLite"
     $sqlitePath = Join-Path $paths.ShopData 'shop.sqlite'
     $schema = @'
-
 CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -1231,13 +1169,14 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at TEXT,
     updated_at TEXT,
     FOREIGN KEY(product_id) REFERENCES products(id)
-
 );
 CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message TEXT,
     created_at TEXT
-);CREATE INDEX IF NOT EXISTS idx_orders_external_id ON orders(external_id);
+);
+CREATE INDEX IF NOT EXISTS idx_orders_external_id ON orders(external_id);
+
 INSERT OR IGNORE INTO products (id, name, price, command) VALUES (1, 'Diamentowy miecz', 1.00, '/give %player% diamond_sword 1');
 INSERT OR IGNORE INTO products (id, name, price, command) VALUES (2, 'Elytra', 15.00, '/give %player% elytra 1');
 '@
@@ -1246,25 +1185,28 @@ INSERT OR IGNORE INTO products (id, name, price, command) VALUES (2, 'Elytra', 1
     & $phpExe -r "\$db=new SQLite3('$sqlitePath');\$schema=file_get_contents('$schemaFile');\$db->exec(\$schema);"
     & $phpExe -r "\$db=new SQLite3('$sqlitePath');\$columns=array();\$result=\$db->query('PRAGMA table_info(orders)');while(\$row=\$result->fetchArray(SQLITE3_ASSOC)){\$columns[] = \$row['name'];}if(!in_array('payload',\$columns,true)){\$db->exec('ALTER TABLE orders ADD COLUMN payload TEXT');}\$result2=\$db->query('PRAGMA table_info(orders)');\$columns2=array();while(\$row2=\$result2->fetchArray(SQLITE3_ASSOC)){\$columns2[] = \$row2['name'];}if(!in_array('provider',\$columns2,true)){\$db->exec('ALTER TABLE orders ADD COLUMN provider TEXT');}\$db->close();"
 
-    Write-Section "Serwer PHP jako usługa"
-    $shopLog = Join-Path $paths.Logs 'shop-service.log'
-    Ensure-NssmService -ServiceName 'ShopPhpService' -DisplayName 'Minecraft Shop Service' -Executable $phpExe -Arguments "-S 127.0.0.1:8081 -t `"$($paths.ShopPublic)`"" -WorkingDirectory $paths.Shop -StdOutLog $shopLog -StdErrLog $shopLog
+    Write-Section "Serwer PHP (FastCGI)"
+    $phpCgiExe = Join-Path $paths.PHP 'php-cgi.exe'
+    if (-not (Test-Path -LiteralPath $phpCgiExe)) {
+        throw "Nie znaleziono $phpCgiExe. Upewnij się, że wersja NTS PHP zawiera php-cgi.exe"
+    }
+    $phpCgiLog = Join-Path $paths.Logs 'shop-phpcgi.log'
+    Ensure-NssmService -ServiceName 'ShopPhpCgi' -DisplayName 'Minecraft Shop FastCGI' -Executable $phpCgiExe -Arguments '-b 127.0.0.1:9000' -WorkingDirectory $paths.Shop -StdOutLog $phpCgiLog -StdErrLog $phpCgiLog
     $legacyTask = Get-ScheduledTask -TaskName 'ShopService@Startup' -ErrorAction SilentlyContinue
     if ($legacyTask) { Unregister-ScheduledTask -TaskName 'ShopService@Startup' -Confirm:$false }
-
-    Write-Section "Serwer PHP (php-cgi)"
-    $phpLog = Join-Path $paths.Logs 'php-cgi.log'
-    $phpArgs = '-b 127.0.0.1:9000 -c "' + $paths.PHP + '"'
-    Install-NssmService -NssmExe $nssmExe -ServiceName 'ShopPhpCgi' -DisplayName 'Sklep Minecraft PHP (FastCGI)' -Executable $phpCgiExe -Arguments $phpArgs -WorkingDirectory $paths.ShopPublic -StdOut $phpLog -StdErr $phpLog
-
+    $legacyService = Get-Service -Name 'ShopPhpService' -ErrorAction SilentlyContinue
+    if ($legacyService) {
+        Write-Host "[INFO] Usuwam przestarzałą usługę ShopPhpService" -ForegroundColor Yellow
+        Stop-Service -Name 'ShopPhpService' -Force -ErrorAction SilentlyContinue
+        & (Ensure-Nssm -BinPath $paths.Bin) remove ShopPhpService confirm | Out-Null
+    }
 
     Write-Section "Konfiguracja RCON serwera Minecraft"
     $serverProps = 'C:\SERWER\server.properties'
-    $serverJar = 'C:\SERWER\server.jar'
     if (-not (Test-Path -LiteralPath $serverProps)) {
         throw "Nie znaleziono C:\SERWER\server.properties"
     }
-    Test-JavaServer -JavaExe $javaExe -ServerJar $serverJar
+
     $props = Get-Content -Path $serverProps
     $rconPassword = $null
     $modified = $false
@@ -1296,57 +1238,38 @@ INSERT OR IGNORE INTO products (id, name, price, command) VALUES (2, 'Elytra', 1
         $secretsData.Rcon.UpdatedAt = (Get-Date).ToString('o')
     }
     Save-Json -Path $secretsPath -Data $secretsData
-    icacls $secretsPath /inheritance:r | Out-Null
-    icacls $secretsPath /grant:r 'Administrators:F' | Out-Null
+    $recoveryPath = Join-Path $paths.FirstBoot 'recovery.txt'
+    @"
+MeshCentral login: $global:MeshAdminUser
+MeshCentral password: $([string]::IsNullOrEmpty($global:MeshAdminPass) ? '<niezmienione>' : $global:MeshAdminPass)
+Shop admin login: $($secretsData.Admin.Username)
+Shop admin password: $([string]::IsNullOrEmpty($adminPass) ? '<niezmienione>' : $adminPass)
+RCON password: $([string]::IsNullOrEmpty($rconPassword) ? '<bez zmian>' : $rconPassword)
+"@ | Out-File -FilePath $recoveryPath -Encoding UTF8
 
+    $adminCredPath = Join-Path $paths.FirstBoot 'admin.credentials'
+    $adminCredContent = @{
+        MeshAdmin = @{ Username = $global:MeshAdminUser; Password = if ($global:MeshAdminPass) { $global:MeshAdminPass } else { '<niezmienione>' } }
+        ShopAdmin = @{ Username = $secretsData.Admin.Username; Password = if ($adminPass) { $adminPass } else { '<niezmienione>' } }
+        Rcon = @{ Password = if ($rconPassword) { $rconPassword } else { '<bez zmian>' } }
+    }
+    Save-Json -Path $adminCredPath -Data $adminCredContent
+
+    foreach ($secureFile in @($secretsPath,$recoveryPath,$adminCredPath)) {
+        icacls $secureFile /inheritance:r | Out-Null
+        icacls $secureFile /grant:r 'Administrators:F' | Out-Null
+    }
 
     Write-Section "Autostart serwera Minecraft"
     $startBat = 'C:\SERWER\start-server.bat'
-    $javaPathFile = Join-Path $paths.FirstBoot 'java-path.txt'
-    Set-Content -Path $javaPathFile -Value $javaExe -Encoding ASCII
-    icacls $javaPathFile /inheritance:r | Out-Null
-    icacls $javaPathFile /grant:r 'Administrators:F' | Out-Null
-
-    @'
+    if (-not (Test-Path -LiteralPath $startBat)) {
+        @'
 @echo off
-setlocal ENABLEDELAYEDEXPANSION
-
-set "SERVER_DIR=C:\SERWER"
-set "SERVER_JAR=%SERVER_DIR%\server.jar"
-set "JAVA_HINT_FILE=C:\Infra\firstboot\java-path.txt"
-
-if exist "%JAVA_HINT_FILE%" (
-    set /p JAVA_PATH=<"%JAVA_HINT_FILE%"
-)
-
-if not defined JAVA_PATH (
-    if defined JAVA_HOME (
-        if exist "%JAVA_HOME%\bin\java.exe" set "JAVA_PATH=%JAVA_HOME%\bin\java.exe"
-    )
-)
-
-if not defined JAVA_PATH (
-    for /f "usebackq delims=" %%J in (`powershell -NoProfile -Command "& { $c=@(); if ($env:JAVA_HOME) { $c += Join-Path $env:JAVA_HOME 'bin\\java.exe' }; if (Test-Path 'C:\\Infra\\bin\\java') { Get-ChildItem -Path 'C:\\Infra\\bin\\java' -Directory -Filter 'jdk-21*' -EA SilentlyContinue | Sort-Object Name -Descending | ForEach-Object { $c += (Join-Path $_.FullName 'bin\\java.exe') } }; $c += 'C:\\Program Files\\Microsoft\\jdk-21.0.8.9-hotspot\\bin\\java.exe'; $c | Where-Object { Test-Path $_ } | Select-Object -First 1 }"`) do set "JAVA_PATH=%%~J"
-)
-
-if not defined JAVA_PATH (
-    echo [ERROR] Nie znaleziono Java 21. Uruchom ponownie setup.ps1.
-    exit /b 1
-)
-
-if not exist "%JAVA_PATH%" (
-    echo [ERROR] Skonfigurowany plik java.exe nie istnieje: %JAVA_PATH%
-    exit /b 1
-)
-
-if not exist "%SERVER_JAR%" (
-    echo [ERROR] Nie znaleziono pliku "%SERVER_JAR%".
-    exit /b 1
-)
-
-cd /d "%SERVER_DIR%"
-"%JAVA_PATH%" -Xms128M -XX:MaxRAMPercentage=95.0 -Dterminal.jline=false -Dterminal.ansi=true -jar "%SERVER_JAR%"
+cd /d "C:\SERWER"
+"C:\Program Files\Microsoft\jdk-21.0.8.9-hotspot\bin\java.exe" -Xms128M -XX:MaxRAMPercentage=95.0 -Dterminal.jline=false -Dterminal.ansi=true -jar server.jar
 '@ | Out-File -FilePath $startBat -Encoding ASCII
+    }
+
     $mcAction = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c "C:\SERWER\start-server.bat"'
     $mcTrigger = New-ScheduledTaskTrigger -AtStartup
     Ensure-ScheduledTask -TaskName 'Minecraft@Startup' -Action $mcAction -Trigger $mcTrigger -Description 'Start serwera Minecraft'
@@ -1354,24 +1277,56 @@ cd /d "%SERVER_DIR%"
     Write-Section "playit.gg"
     $playitExe = Join-Path $paths.Bin 'playit.exe'
     Download-IfMissing -Uri 'https://github.com/playit-cloud/playit-agent/releases/latest/download/playit.exe' -Destination $playitExe -Description 'Pobieranie playit.gg agent'
+    $playitStatus = [ordered]@{
+        DeviceLinkStarted = $false
+        AppliedFromFile = $false
+        AppliedMessage = ''
+        Tunnels = @()
+        TunnelsError = ''
+    }
     if (-not $SkipDeviceLink) {
         Write-Host "Uruchamiam tryb device-link. Postępuj zgodnie z instrukcjami w konsoli." -ForegroundColor Yellow
         Start-Process -FilePath $playitExe -ArgumentList 'device-link'
+        $playitStatus.DeviceLinkStarted = $true
         Write-Host "Połącz urządzenie w przeglądarce i utwórz tunele." -ForegroundColor Green
+    }
+    $playitConfigPath = Join-Path $paths.Bin 'playit-tunnels.txt'
+    if (Test-Path -LiteralPath $playitConfigPath) {
+        Write-Host "Wykryto playit-tunnels.txt – próbuję zastosować tunelową konfigurację." -ForegroundColor Yellow
+        try {
+            $applyOutput = & $playitExe 'tunnels' 'apply' $playitConfigPath 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $playitStatus.AppliedFromFile = $true
+                $playitStatus.AppliedMessage = ($applyOutput | Out-String).Trim()
+                Write-Host "[OK] Zastosowano konfigurację tuneli z pliku." -ForegroundColor DarkGreen
+            }
+            else {
+                $playitStatus.AppliedMessage = ($applyOutput | Out-String).Trim()
+                Write-Warning "Nie udało się zastosować konfiguracji tuneli: $($playitStatus.AppliedMessage)"
+            }
+        }
+        catch {
+            $playitStatus.AppliedMessage = $_.Exception.Message
+            Write-Warning "Błąd podczas stosowania konfiguracji tuneli: $($playitStatus.AppliedMessage)"
+        }
+    }
+    try {
+        $tunnelOutput = & $playitExe 'tunnels' 'list' '--json' 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $playitStatus.Tunnels = ($tunnelOutput | Out-String | ConvertFrom-Json -ErrorAction Stop)
+        }
+        else {
+            $playitStatus.TunnelsError = ($tunnelOutput | Out-String).Trim()
+        }
+    }
+    catch {
+        $playitStatus.TunnelsError = $_.Exception.Message
     }
     Write-Host "Docelowe tunele: 443→8443, 11131→11131, 11141→11141." -ForegroundColor Cyan
 
-    $playitCommands = @(
-        'playit.exe tunnel create tcp --local 127.0.0.1:8443 --remote 0.0.0.0:443 --name "Portal HTTPS"'
-        'playit.exe tunnel create tcp --local 127.0.0.1:11131 --remote 0.0.0.0:11131 --name "Minecraft"'
-        'playit.exe tunnel create tcp --local 127.0.0.1:11141 --remote 0.0.0.0:11141 --name "BlueMap"'
-    )
-    $playitHints = Join-Path $paths.FirstBoot 'playit-tunnels.txt'
-    $playitCommands | Out-File -FilePath $playitHints -Encoding UTF8
-    Write-Host "Lista komend Playit zapisana w $playitHints" -ForegroundColor Green
-
     Write-Section "Zadania i logi"
-    foreach ($logName in @('shop.log','shop-delivery.log','shop-service.log','caddy-service.log')) {
+    foreach ($logName in @('shop.log','shop-delivery.log','shop-phpcgi.log','caddy-service.log')) {
+
         $logFilePath = Join-Path $paths.Logs $logName
         if (-not (Test-Path -LiteralPath $logFilePath)) {
             New-Item -Path $logFilePath -ItemType File -Force | Out-Null
@@ -1385,41 +1340,107 @@ cd /d "%SERVER_DIR%"
     Write-Section "Zapis sekretów"
     $secretFile = Join-Path $paths.FirstBoot 'secrets.json'
     $secrets = @{
-        AdminPanel = @{
-            Username = $adminData.Username
-            PasswordProtected = if ($adminPass) { Protect-Secret $adminPass } else { '<niezmienione>' }
-        }
-        RconPasswordProtected = Protect-Secret $rconPassword
+        AdminPanel = @{ Username = $secretsData.Admin.Username; Password = if ($adminPass) { $adminPass } else { '<niezmienione>' } }
+        RconPassword = if ($rconPassword) { $rconPassword } else { '<bez zmian>' }
+        MeshCentral = @{ Username = $global:MeshAdminUser; Password = if ($global:MeshAdminPass) { $global:MeshAdminPass } else { '<niezmienione>' } }
+        PSPProvider = $secretsData.PSP.Provider
 
     }
     Save-Json -Path $secretFile -Data $secrets
     icacls $secretFile /inheritance:r | Out-Null
     icacls $secretFile /grant:r 'Administrators:F' | Out-Null
 
-    $recoveryFile = Join-Path $paths.FirstBoot 'recovery.txt'
-    $recoveryLines = @()
-    if ($adminPass) {
-        $recoveryLines += "Sklep admin login: $($adminData.Username)"
-        $recoveryLines += "Sklep admin hasło: $adminPass"
-    }
-    if ($rconPassword) {
-        $recoveryLines += "RCON hasło: $rconPassword"
-    }
-    if ($recoveryLines.Count -gt 0) {
-        $recoveryLines | Out-File -FilePath $recoveryFile -Encoding UTF8
-        icacls $recoveryFile /inheritance:r | Out-Null
-        icacls $recoveryFile /grant:r 'Administrators:F' | Out-Null
-    }
-
     Write-Section "Uruchamianie usług"
-    $services = @('CaddyReverseProxy','MeshCentral') | ForEach-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue }
-
+    $services = @('CaddyReverseProxy','MeshCentral','ShopPhpCgi','Mesh Agent') | ForEach-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue }
     foreach ($svc in $services) {
         if ($svc -and $svc.Status -ne 'Running') { Start-Service -Name $svc.Name }
     }
 
     if (-not $global:MeshAgentInstalled -and -not (Get-Service -Name 'Mesh Agent' -ErrorAction SilentlyContinue)) {
-        Write-Warning 'MeshAgent nie został zainstalowany automatycznie. Pobierz instalator z http://localhost:8080/desk po zalogowaniu.'
+        Write-Warning 'MeshAgent nie został zainstalowany automatycznie. Pobierz instalator z https://localhost:8443/desk po zalogowaniu.'
+    }
+
+    Write-Section "Kontrola zdrowia usług"
+    $webCheckSummary = {
+        param($result, $url)
+        $obj = [ordered]@{ Url = $url; Success = $false; StatusCode = $null; Error = '' }
+        if ($result -is [Microsoft.PowerShell.Commands.BasicHtmlWebResponseObject]) {
+            $obj.Success = ($result.StatusCode -eq 200)
+            $obj.StatusCode = $result.StatusCode
+        }
+        else {
+            $obj.Error = ($result | Out-String).Trim()
+        }
+        if (-not $obj.Success -and -not [string]::IsNullOrEmpty($obj.Error)) {
+            Write-Warning "Health-check nie powiódł się dla $url: $($obj.Error)"
+        }
+        elseif (-not $obj.Success) {
+            Write-Warning "Health-check nie powiódł się dla $url"
+        }
+        else {
+            Write-Host "[OK] $url" -ForegroundColor DarkGreen
+        }
+        return $obj
+    }
+
+    $shopCheck = $null
+    $mapCheck = $null
+    try { $shopCheck = Invoke-LocalHttps -Uri 'https://localhost:8443/shop/' } catch { $shopCheck = $_ }
+    try { $mapCheck = Invoke-LocalHttps -Uri 'https://localhost:8443/map/' } catch { $mapCheck = $_ }
+
+    $meshDeskResult = & $webCheckSummary $deskCheck 'https://localhost:8443/desk/'
+    $meshDeskScriptResult = & $webCheckSummary $deskScriptCheck 'https://localhost:8443/desk/scripts/common.js'
+    $shopResult = & $webCheckSummary $shopCheck 'https://localhost:8443/shop/'
+    $mapResult = & $webCheckSummary $mapCheck 'https://localhost:8443/map/'
+
+    $rconResult = [ordered]@{ Success = $false; Output = ''; Error = '' }
+    try {
+        $rconOutput = & $deliverPath -Player 'InfraHealth' -CommandTemplate 'say Infra setup health-check OK' -ErrorAction Stop
+        $rconResult.Success = $true
+        $rconResult.Output = ($rconOutput | Out-String).Trim()
+        Write-Host "[OK] Test komendy RCON wykonany." -ForegroundColor DarkGreen
+    }
+    catch {
+        $rconResult.Error = $_.Exception.Message
+        Write-Warning "Test komendy RCON nie powiódł się: $($rconResult.Error)"
+    }
+
+    $playitReport = [ordered]@{
+        Success = $false
+        DeviceLinkStarted = $playitStatus.DeviceLinkStarted
+        AppliedFromFile = $playitStatus.AppliedFromFile
+        AppliedMessage = $playitStatus.AppliedMessage
+        Tunnels = $playitStatus.Tunnels
+        TunnelsError = $playitStatus.TunnelsError
+    }
+    if ($playitStatus.Tunnels) {
+        $tunnelCount = ($playitStatus.Tunnels | Measure-Object).Count
+        if ($tunnelCount -gt 0) { $playitReport.Success = $true }
+    }
+    elseif (-not [string]::IsNullOrEmpty($playitStatus.TunnelsError)) {
+        $playitReport.Tunnels = @()
+    }
+
+    $readyReport = [ordered]@{
+        Timestamp = (Get-Date).ToString('o')
+        MeshRoutingMode = $meshRoutingMode
+        Java = $javaStatus
+        MeshDesk = $meshDeskResult
+        MeshDeskScript = $meshDeskScriptResult
+        Shop = $shopResult
+        Map = $mapResult
+        Rcon = $rconResult
+        Playit = $playitReport
+    }
+    $readyReportPath = Join-Path $paths.FirstBoot 'ready-report.json'
+    Save-Json -Path $readyReportPath -Data $readyReport
+
+    $failedChecks = $readyReport.GetEnumerator() | Where-Object { $_.Value -is [System.Collections.IDictionary] -and $_.Value.Contains('Success') -and -not $_.Value.Success }
+    if ($failedChecks) {
+        Write-Host "[ALERT] Nie wszystkie health-checki zakończyły się sukcesem – sprawdź ready-report.json" -ForegroundColor Red
+    }
+    else {
+        Write-Host "[OK] Wszystkie health-checki zakończone powodzeniem." -ForegroundColor DarkGreen
     }
 
 
@@ -1427,39 +1448,37 @@ cd /d "%SERVER_DIR%"
     $status = [ordered]@{
         Caddy = (Get-Service -Name 'CaddyReverseProxy' -ErrorAction SilentlyContinue)?.Status
         MeshCentral = (Get-Service -Name 'MeshCentral' -ErrorAction SilentlyContinue)?.Status
-        ShopPhpCgi = (Get-Service -Name 'ShopPhpCgi' -ErrorAction SilentlyContinue)?.Status
+        ShopService = (Get-Service -Name 'ShopPhpCgi' -ErrorAction SilentlyContinue)?.Status
+        MeshAgent = (Get-Service -Name 'Mesh Agent' -ErrorAction SilentlyContinue)?.Status
 
         Minecraft = (Get-ScheduledTask -TaskName 'Minecraft@Startup' -ErrorAction SilentlyContinue) ? 'ScheduledTask'
     }
     $status.GetEnumerator() | ForEach-Object { Write-Host ("{0,-12}: {1}" -f $_.Key, $_.Value) }
 
-    $readyFlag = Join-Path $paths.FirstBoot 'READY.flag'
-    'READY' | Out-File -FilePath $readyFlag -Encoding ASCII
-    icacls $readyFlag /inheritance:r | Out-Null
-    icacls $readyFlag /grant:r 'Administrators:F' | Out-Null
-
-    $readyReport = @{
-        Timestamp = (Get-Date).ToString('o')
-        Endpoints = @{
-            Portal = 'https://localhost:8443/'
-            Desk = 'https://localhost:8443/desk'
-            Shop = 'https://localhost:8443/shop'
-            Map = 'https://localhost:8443/map'
-        }
-        Services = $status
-    }
-    Save-Json -Path (Join-Path $paths.FirstBoot 'ready-report.json') -Data $readyReport
+    Write-Host "`nSekrety (maskowane):" -ForegroundColor Cyan
+    $meshPassDisplay = if ($global:MeshAdminPass) { Mask-Secret $global:MeshAdminPass } else { '<niezmienione>' }
+    $shopPassDisplay = if ($adminPass) { Mask-Secret $adminPass } else { '<niezmienione>' }
+    $rconPassDisplay = if ($rconPassword) { Mask-Secret $rconPassword } else { '<bez zmian>' }
+    Write-Host "   MeshCentral: $global:MeshAdminUser / $meshPassDisplay"
+    Write-Host "   Sklep admin: $($secretsData.Admin.Username) / $shopPassDisplay"
+    Write-Host "   RCON: $rconPassDisplay"
+    Write-Host "   Raport health-check: $readyReportPath"
 
     Write-Host "`nCo teraz:" -ForegroundColor Green
     Write-Host "1. Dokończ device-link w Playit i utwórz tunele:" -ForegroundColor Green
     Write-Host "   - 443 -> 8443 (HTTPS portal/sklep/desk)" -ForegroundColor Green
     Write-Host "   - 11131 -> 11131 (Minecraft)" -ForegroundColor Green
     Write-Host "   - 11141 -> 11141 (BlueMap)" -ForegroundColor Green
-    Write-Host "2. Testuj lokalnie: https://localhost:8443/desk, /shop, /map (zaakceptuj ostrzeżenie TLS)" -ForegroundColor Green
+    Write-Host "2. Testuj lokalnie: https://localhost:8443/desk, /shop, /map (certyfikat self-signed)." -ForegroundColor Green
     Write-Host "3. Skonfiguruj klucze PSP: C:\Infra\shop\configure-psp.ps1" -ForegroundColor Green
-    Write-Host "4. Wykonaj test sandbox BLIK 1 PLN i potwierdź dostarczenie przedmiotu." -ForegroundColor Green
-    Write-Host "5. Pamiętaj: certyfikat TLS od Caddy (tls internal) jest self-signed – przeglądarka pokaże ostrzeżenie do czasu podpięcia własnej domeny." -ForegroundColor Yellow
+    Write-Host "4. Zanotuj dane dostępowe zapisane w C:\Infra\firstboot\secrets.json (admin panel, MeshCentral)." -ForegroundColor Green
+    Write-Host "5. Wykonaj test sandbox BLIK 1 PLN i potwierdź dostarczenie przedmiotu." -ForegroundColor Green
+    Write-Host "6. Po pierwszym logowaniu do MeshCentral włącz 2FA dla konta administratora." -ForegroundColor Green
+    Write-Host "7. Jeśli posiadasz domenę publiczną, podmień blok TLS w Caddy na konfigurację ACME/Let's Encrypt." -ForegroundColor Green
 
+    if ($meshRoutingMode -eq 'host') {
+        Write-Warning 'Aktywowano dodatkowy host https://desk.localhost:8443 dla MeshCentral – użyj go, jeśli ścieżka /desk nie działa przez tunel.'
+    }
 
 }
 catch {
