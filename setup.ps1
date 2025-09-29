@@ -142,6 +142,15 @@ function Generate-Secret {
     ($bytes | ForEach-Object { $chars[ $_ % $chars.Length ] }) -join ''
 }
 
+function Generate-CliSafeSecret {
+    param([int]$Length = 32)
+    $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    $bytes = New-Object byte[] $Length
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    ($bytes | ForEach-Object { $chars[ $_ % $chars.Length ] }) -join ''
+}
+
+
 function Protect-Secret {
     param([string]$Secret)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Secret)
@@ -328,6 +337,79 @@ Logi są rotowane przez skrypt zadań harmonogramu "InfraLogRotate". Maksymalny 
     }
 }
 
+function Ensure-Nssm {
+    param([string]$BinPath)
+    $nssmExe = Join-Path $BinPath 'nssm.exe'
+    if (-not (Test-Path -LiteralPath $nssmExe)) {
+        Write-Host "[INFO] Pobieram NSSM" -ForegroundColor Yellow
+        $zipPath = Join-Path ([System.IO.Path]::GetTempPath()) 'nssm.zip'
+        Invoke-WebRequest -Uri 'https://nssm.cc/release/nssm-2.24.zip' -OutFile $zipPath -UseBasicParsing
+        $extractDir = Join-Path ([System.IO.Path]::GetTempPath()) 'nssm-2.24'
+        if (Test-Path $extractDir) { Remove-Item -Path $extractDir -Recurse -Force }
+        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+        $src = Join-Path $extractDir 'nssm-2.24\win64\nssm.exe'
+        if (-not (Test-Path -LiteralPath $src)) {
+            throw "Nie udało się znaleźć pliku nssm.exe po rozpakowaniu"
+        }
+        Ensure-Directory $BinPath
+        Copy-Item -Path $src -Destination $nssmExe -Force
+        Remove-Item -Path $zipPath -Force
+        Remove-Item -Path $extractDir -Recurse -Force
+    }
+    return $nssmExe
+}
+
+function Ensure-NssmService {
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)][string]$Executable,
+        [string]$Arguments = '',
+        [string]$WorkingDirectory = '',
+        [string]$StdOutLog = $null,
+        [string]$StdErrLog = $null
+    )
+
+    $nssmExe = Ensure-Nssm -BinPath $paths.Bin
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $service) {
+        Write-Host "[SVC] Tworzę usługę (NSSM) $DisplayName" -ForegroundColor Yellow
+        & $nssmExe install $ServiceName $Executable $Arguments | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Nie udało się zainstalować usługi $ServiceName" }
+        & $nssmExe set $ServiceName DisplayName $DisplayName | Out-Null
+        & $nssmExe set $ServiceName Start SERVICE_AUTO_START | Out-Null
+    }
+    if ($WorkingDirectory) {
+        & $nssmExe set $ServiceName AppDirectory $WorkingDirectory | Out-Null
+    }
+    if ($StdOutLog) {
+        Ensure-Directory ([System.IO.Path]::GetDirectoryName($StdOutLog))
+        & $nssmExe set $ServiceName AppStdout $StdOutLog | Out-Null
+        & $nssmExe set $ServiceName AppRotateFiles 1 | Out-Null
+        & $nssmExe set $ServiceName AppRotateOnline 1 | Out-Null
+    }
+    if ($StdErrLog) {
+        Ensure-Directory ([System.IO.Path]::GetDirectoryName($StdErrLog))
+        & $nssmExe set $ServiceName AppStderr $StdErrLog | Out-Null
+    }
+    Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
+}
+
+function Write-LogMessage {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Message
+    )
+    $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    Ensure-Directory ([System.IO.Path]::GetDirectoryName($Path))
+    "$timestamp`t$Message" | Out-File -FilePath $Path -Encoding UTF8 -Append
+}
+
+$global:MeshAdminPass = $null
+$global:MeshAdminUser = 'meshadmin'
+$global:MeshAgentInstalled = $false
+
+
 try {
     Write-Section "Walidacja uprawnień"
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -368,6 +450,7 @@ try {
         Remove-NetFirewallRule -DisplayName 'Allow Portal HTTP 8080'
     }
     Ensure-FirewallRule -Name 'Allow-Portal-8443' -DisplayName 'Allow Portal HTTPS 8443' -Action Allow -Direction Inbound -LocalPort 8443
+
     Ensure-FirewallRule -Name 'Allow-Minecraft-11131' -DisplayName 'Allow Minecraft 11131' -Action Allow -Direction Inbound -LocalPort 11131
     Ensure-FirewallRule -Name 'Allow-BlueMap-11141' -DisplayName 'Allow BlueMap 11141' -Action Allow -Direction Inbound -LocalPort 11141
     Ensure-FirewallRule -Name 'Block-RDP-3389' -DisplayName 'Block RDP 3389' -Action Block -Direction Inbound -LocalPort 3389
@@ -381,6 +464,7 @@ try {
     $caddyConfig = @'
 :8443 {
     tls internal
+
     encode gzip
 
     handle_path /desk* {
@@ -391,6 +475,7 @@ try {
             }
             header_up Host {host}
         }
+
     }
 
     handle_path /map* {
@@ -407,11 +492,10 @@ try {
         respond "OK" 200
     }
 }
-'@
-    $caddyConfig | Out-File -FilePath $caddyFile -Encoding UTF8
 
     $caddyLog = Join-Path $paths.Logs 'caddy.log'
     Install-NssmService -NssmExe $nssmExe -ServiceName 'CaddyReverseProxy' -DisplayName 'Caddy Reverse Proxy' -Executable $caddyExe -Arguments "run --config `"$caddyFile`"" -WorkingDirectory $paths.Caddy -StdOut $caddyLog -StdErr $caddyLog
+
 
     Write-Section "Node.js + MeshCentral"
     $nodeRoot = Join-Path $paths.Bin 'node'
@@ -492,6 +576,52 @@ try {
     $meshArgs = '"' + $meshModule + '" --config "' + $meshConfigPath + '"'
     Install-NssmService -NssmExe $nssmExe -ServiceName 'MeshCentral' -DisplayName 'MeshCentral Server' -Executable $nodeExe -Arguments $meshArgs -WorkingDirectory $paths.Mesh -StdOut $meshLog -StdErr $meshLog
 
+    Start-Sleep -Seconds 5
+
+    $meshAdminAccountPath = Join-Path $paths.Mesh "meshcentral-data\users\$($global:MeshAdminUser).json"
+    if (-not (Test-Path -LiteralPath $meshAdminAccountPath)) {
+        $global:MeshAdminPass = Generate-CliSafeSecret -Length 32
+        try {
+            & $nodeExe $meshModule --createaccount $global:MeshAdminUser --pass $global:MeshAdminPass --email "" --admin | Out-Null
+            Write-Host "[INFO] Utworzono konto administracyjne MeshCentral ($global:MeshAdminUser)" -ForegroundColor Yellow
+        }
+        catch {
+            Write-Warning "Nie udało się automatycznie utworzyć konta MeshCentral: $_"
+            $global:MeshAdminPass = $null
+        }
+    }
+
+    try {
+        & $nodeExe $meshModule --createDeviceGroup 'LocalWindowsHost' --user $global:MeshAdminUser | Out-Null
+    }
+    catch {
+        if ($_.Exception.Message -notmatch 'exists') {
+            Write-Warning "Nie udało się utworzyć grupy urządzeń MeshCentral: $_"
+        }
+    }
+
+    $meshAgentService = Get-Service -Name 'Mesh Agent' -ErrorAction SilentlyContinue
+    if (-not $meshAgentService) {
+        Write-Host "[INFO] Instaluję MeshAgent dla zdalnego pulpitu" -ForegroundColor Yellow
+        $agentDir = Join-Path $paths.Mesh 'agent'
+        Ensure-Directory $agentDir
+        $agentExe = Join-Path $agentDir 'meshagent.exe'
+        $previousCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        try {
+            Invoke-WebRequest -Uri 'https://localhost:4430/meshagents?id=1&install=2' -OutFile $agentExe -UseBasicParsing
+            Start-Process -FilePath $agentExe -ArgumentList '-fullinstall' -Wait -WindowStyle Hidden | Out-Null
+            $global:MeshAgentInstalled = $true
+        }
+        catch {
+            Write-Warning "Instalacja MeshAgent nie powiodła się: $_"
+        }
+        finally {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $previousCallback
+        }
+    }
+
+
     Write-Section "PHP 8.x + środowisko sklepu"
     $phpExe = Join-Path $paths.PHP 'php.exe'
     if (-not (Test-Path -LiteralPath $phpExe)) {
@@ -532,33 +662,54 @@ try {
     $configPhp = @'
 <?php
 return [
-    "PSP_PROVIDER" => "TPAY",
-    "ENCRYPTED_CREDENTIALS" => "",
-    "PUBLIC_KEY" => "",
-    "PRIVATE_KEY" => "",
-    "API_KEY" => "",
-    "RCON_PASSWORD" => "",
+    "DB_PATH" => "C:\\Infra\\shop\\data\\shop.sqlite",
+    "LOG_PATH" => "C:\\Infra\\logs\\shop.log",
+    "SECRETS_PATH" => "C:\\Infra\\shop\\config\\secrets.json",
+    "DELIVER_SCRIPT" => "C:\\Infra\\shop\\bin\\deliver.ps1",
     "RCON_HOST" => "127.0.0.1",
     "RCON_PORT" => 25575,
-    "DELIVER_SCRIPT" => "C:\\Infra\\shop\\bin\\deliver.ps1"
+    "SANDBOX" => true
 ];
 '@
     $configPath = Join-Path $paths.ShopConfig 'shop.config.php'
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        $configPhp | Out-File -FilePath $configPath -Encoding UTF8
-    }
+    $configPhp | Out-File -FilePath $configPath -Encoding UTF8
 
-    $adminCredPath = Join-Path $paths.ShopConfig 'admin.credentials.json'
-    if (-not (Test-Path -LiteralPath $adminCredPath)) {
-        $adminUser = 'admin'
-        $adminPass = Generate-Secret -Length 20
-        $hash = [Convert]::ToBase64String([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($adminPass)))
-        $adminData = @{ Username = $adminUser; PasswordHash = $hash }
-        Save-Json -Path $adminCredPath -Data $adminData
+    $secretsPath = Join-Path $paths.ShopConfig 'secrets.json'
+    if (Test-Path -LiteralPath $secretsPath) {
+        $secretsData = Get-Content -Path $secretsPath | ConvertFrom-Json
     }
     else {
-        $adminData = Get-Content -Path $adminCredPath | ConvertFrom-Json
+        $secretsData = [ordered]@{
+            PSP = [ordered]@{
+                Provider = 'TPAY'
+                EncryptedPayload = ''
+                Credentials = @{}
+            }
+            Rcon = [ordered]@{
+                EncryptedPassword = ''
+                UpdatedAt = ''
+            }
+            Admin = [ordered]@{}
+        }
+    }
+
+    $adminUser = $secretsData.Admin.Username
+    if (-not $adminUser) { $adminUser = 'admin' }
+    if (-not $secretsData.Admin.PasswordHash) {
+        $adminPass = Generate-Secret -Length 24
+        $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($adminPass))
+        $hash = [Convert]::ToBase64String($hashBytes)
+        $secretsData.Admin = [ordered]@{
+            Username = $adminUser
+            PasswordHash = $hash
+            PasswordProtected = Protect-Secret -Secret $adminPass
+            UpdatedAt = (Get-Date).ToString('o')
+        }
+    }
+    else {
         $adminPass = $null
+        $secretsData.Admin.Username = $adminUser
+
     }
 
     $rconClient = @'
@@ -622,45 +773,142 @@ return $result
 param(
     [Parameter(Mandatory)][string]$Player,
     [Parameter(Mandatory)][string]$CommandTemplate,
+    [string]$SecretsPath = 'C:\\Infra\\shop\\config\\secrets.json',
     [string]$Host = '127.0.0.1',
     [int]$Port = 25575,
-    [Parameter(Mandatory)][string]$Password
+    [string]$LogPath = 'C:\\Infra\\logs\\shop-delivery.log'
 )
 
-$cmd = $CommandTemplate.Replace('%player%', $Player)
-& 'C:\\Infra\\shop\\bin\\rcon.ps1' -Command $cmd -Host $Host -Port $Port -Password $Password | Out-Null
+function Write-DeliveryLog {
+    param([string]$Message)
+    $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    "$timestamp`t$Message" | Out-File -FilePath $LogPath -Encoding UTF8 -Append
+}
+
+try {
+    if (-not (Test-Path -LiteralPath $SecretsPath)) {
+        throw "Brak pliku z sekretami: $SecretsPath"
+    }
+    $data = Get-Content -LiteralPath $SecretsPath | ConvertFrom-Json
+    $encrypted = $data.Rcon.EncryptedPassword
+    if ([string]::IsNullOrWhiteSpace($encrypted)) {
+        throw 'Brak zaszyfrowanego hasła RCON w secrets.json'
+    }
+    $bytes = [Convert]::FromBase64String($encrypted)
+    $password = [System.Text.Encoding]::UTF8.GetString([System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine))
+    $cmd = $CommandTemplate.Replace('%player%', $Player)
+    $result = & 'C:\\Infra\\shop\\bin\\rcon.ps1' -Command $cmd -Host $Host -Port $Port -Password $password
+    Write-DeliveryLog "Wysłano polecenie '$cmd' do gracza $Player: $result"
+    Write-Output $result
+}
+catch {
+    Write-DeliveryLog "Błąd podczas dostarczania nagrody dla $Player: $_"
+    throw
+}
+
 '@
     $deliverPath = Join-Path $paths.ShopBin 'deliver.ps1'
     $deliverScript | Out-File -FilePath $deliverPath -Encoding UTF8
 
+    $secretReader = @'
+param(
+    [Parameter(Mandatory)][string]$Encrypted
+)
+
+$bytes = [Convert]::FromBase64String($Encrypted)
+$plain = [System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+[System.Text.Encoding]::UTF8.GetString($plain)
+'@
+    $secretReaderPath = Join-Path $paths.ShopBin 'read-secret.ps1'
+    $secretReader | Out-File -FilePath $secretReaderPath -Encoding UTF8
+
     $indexPhp = @'
 <?php
+declare(strict_types=1);
 $config = require __DIR__ . '/../config/shop.config.php';
-$products = [
-    ['id' => 1, 'name' => 'Diamentowy miecz', 'price' => 1.00, 'command' => '/give %player% diamond_sword 1'],
-    ['id' => 2, 'name' => 'Elytra', 'price' => 15.00, 'command' => '/give %player% elytra 1']
-];
+$secrets = json_decode(file_get_contents($config['SECRETS_PATH']), true);
+$providerName = strtoupper($secrets['PSP']['Provider'] ?? 'TPAY');
+$db = new SQLite3($config['DB_PATH']);
+$db->exec('PRAGMA foreign_keys = ON');
+$products = [];
+$result = $db->query('SELECT id, name, price, command FROM products ORDER BY id');
+while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+    $products[] = $row;
+}
+$message = '';
+$reference = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $player = trim($_POST['player'] ?? '');
+    $productId = (int)($_POST['product'] ?? 0);
+    if ($player && $productId) {
+        $stmt = $db->prepare('SELECT id, name, price, command FROM products WHERE id = :id');
+        $stmt->bindValue(':id', $productId, SQLITE3_INTEGER);
+        $product = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        if ($product) {
+            $reference = bin2hex(random_bytes(8));
+            $insert = $db->prepare('INSERT INTO orders (external_id, product_id, player, amount, currency, status, provider, created_at, updated_at) VALUES (:ext, :pid, :player, :amount, :currency, :status, :provider, datetime("now"), datetime("now"))');
+            $insert->bindValue(':ext', $reference, SQLITE3_TEXT);
+            $insert->bindValue(':pid', $product['id'], SQLITE3_INTEGER);
+            $insert->bindValue(':player', $player, SQLITE3_TEXT);
+            $insert->bindValue(':amount', $product['price'], SQLITE3_FLOAT);
+            $insert->bindValue(':currency', 'PLN', SQLITE3_TEXT);
+            $insert->bindValue(':status', 'PENDING', SQLITE3_TEXT);
+            $insert->bindValue(':provider', $providerName, SQLITE3_TEXT);
+            $insert->execute();
+            $message = 'Zamówienie utworzone. Użyj poniższego identyfikatora jako session_id/order_id w panelu PSP sandbox.';
+        } else {
+            $message = 'Nie znaleziono produktu.';
+        }
+    } else {
+        $message = 'Podaj nick gracza i produkt.';
+    }
+}
+
 ?>
 <!doctype html>
 <html lang="pl">
 <head>
     <meta charset="utf-8">
     <title>Sklep Minecraft</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 2rem; }
+        form { margin-top: 1rem; display: grid; gap: 1rem; max-width: 420px; }
+        label { display: flex; flex-direction: column; font-weight: 600; }
+        input, select { padding: 0.5rem; font-size: 1rem; }
+        .message { margin-top: 1rem; padding: 1rem; background: #eef; border-left: 4px solid #36c; }
+        code { background: #f4f4f4; padding: 0.1rem 0.3rem; }
+    </style>
 </head>
 <body>
-<h1>Sklep Minecraft — płatności BLIK</h1>
-<form method="post" action="/shop/webhook.php">
-    <label>Nick gracza: <input type="text" name="player" required></label>
-    <label>Produkt:
+<h1>Sklep Minecraft — płatności <?= htmlspecialchars($providerName); ?> (sandbox)</h1>
+<p>Wypełnij formularz, aby utworzyć zamówienie. Po pomyślnej płatności BLIK przedmiot zostanie wydany automatycznie na serwerze.</p>
+<?php if ($message): ?>
+    <div class="message">
+        <p><?= htmlspecialchars($message); ?></p>
+        <?php if ($reference): ?>
+            <p><strong>Identyfikator zamówienia:</strong> <code><?= htmlspecialchars($reference); ?></code></p>
+            <p>Wprowadź ten identyfikator jako <em>session_id/order_id</em> w panelu sandbox wybranego PSP.</p>
+        <?php endif; ?>
+    </div>
+<?php endif; ?>
+<form method="post" action="">
+    <label>Nick gracza
+        <input type="text" name="player" required minlength="3" maxlength="16">
+    </label>
+    <label>Produkt
         <select name="product" required>
+            <option value="">-- Wybierz --</option>
             <?php foreach ($products as $product): ?>
-                <option value="<?= $product['id']; ?>"><?= htmlspecialchars($product['name']); ?> — <?= number_format($product['price'], 2); ?> PLN</option>
+                <option value="<?= (int)$product['id']; ?>">
+                    <?= htmlspecialchars($product['name']); ?> — <?= number_format((float)$product['price'], 2); ?> PLN
+                </option>
             <?php endforeach; ?>
         </select>
     </label>
-    <button type="submit">Kup teraz (sandbox)</button>
+    <button type="submit">Generuj zamówienie sandbox</button>
 </form>
-<p>Po zrealizowaniu płatności BLIK przedmiot zostanie wysłany automatycznie.</p>
+<p>Webhook: <code>/shop/webhook.php</code>. Skonfiguruj go w panelu PSP.</p>
+
 </body>
 </html>
 '@
@@ -669,21 +917,149 @@ $products = [
 
     $webhookPhp = @'
 <?php
+declare(strict_types=1);
 $config = require __DIR__ . '/../config/shop.config.php';
+$logFile = $config['LOG_PATH'];
+$secrets = json_decode(file_get_contents($config['SECRETS_PATH']), true);
+$provider = strtoupper($secrets['PSP']['Provider'] ?? 'TPAY');
+
+function shop_log(string $message, string $logFile): void {
+    $timestamp = (new DateTimeImmutable('now'))->format('Y-m-d H:i:s');
+    file_put_contents($logFile, $timestamp . "\t" . $message . PHP_EOL, FILE_APPEND | LOCK_EX);
+}
+
+function decrypt_secret(array $secrets, string $logFile): ?array {
+    $encrypted = $secrets['PSP']['EncryptedPayload'] ?? '';
+    if (!$encrypted) {
+        return null;
+    }
+    $reader = realpath(__DIR__ . '/../bin/read-secret.ps1');
+    if (!$reader) {
+        shop_log('Brak read-secret.ps1', $logFile);
+        return null;
+    }
+    $command = 'powershell -NoProfile -ExecutionPolicy Bypass -File ' . escapeshellarg($reader) . ' -Encrypted ' . escapeshellarg($encrypted);
+    $json = shell_exec($command);
+    if (!$json) {
+        shop_log('Nie udało się odszyfrować sekretów PSP', $logFile);
+        return null;
+    }
+    $decoded = json_decode(trim($json), true);
+    if (!is_array($decoded)) {
+        shop_log('Niepoprawny JSON z sekretów PSP', $logFile);
+        return null;
+    }
+    return $decoded;
+}
+
+function verify_tpay(array $data, array $creds): bool {
+    $sign = strtolower($data['sign'] ?? '');
+    $merchant = $creds['merchant_id'] ?? '';
+    $secret = $creds['secret'] ?? '';
+    $trId = $data['tr_id'] ?? '';
+    if (!$sign || !$merchant || !$secret || !$trId) {
+        return false;
+    }
+    $expected = hash('sha256', $merchant . '|' . $trId . '|' . ($data['amount'] ?? '') . '|' . $secret);
+    return hash_equals($expected, $sign);
+}
+
+function verify_p24(array $data, array $creds): bool {
+    $sign = strtolower($data['p24_sign'] ?? '');
+    $crc = $creds['crc'] ?? '';
+    $sessionId = $data['p24_session_id'] ?? '';
+    $orderId = $data['p24_order_id'] ?? '';
+    $amount = $data['p24_amount'] ?? '';
+    $currency = $data['p24_currency'] ?? '';
+    if (!$sign || !$crc || !$sessionId || !$orderId || !$amount || !$currency) {
+        return false;
+    }
+    $expected = md5($sessionId . '|' . $orderId . '|' . $amount . '|' . $currency . '|' . $crc);
+    return hash_equals($expected, $sign);
+}
+
 $payload = file_get_contents('php://input');
 $data = $_POST ?: json_decode($payload, true) ?: [];
-$status = strtoupper($data['status'] ?? '');
-$player = $data['player'] ?? '';
-$command = $data['command'] ?? '';
-if ($status === 'PAID' && $player && $command) {
-    $password = $config['RCON_PASSWORD'];
-    $deliver = $config['DELIVER_SCRIPT'];
-    $cmd = 'powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($deliver) . ' -Player ' . escapeshellarg($player) . ' -CommandTemplate ' . escapeshellarg($command) . ' -Password ' . escapeshellarg($password);
-    shell_exec($cmd);
-    http_response_code(200);
-    echo json_encode(['status' => 'OK']);
+if (!$data) {
+    http_response_code(400);
+    echo json_encode(['error' => 'Brak danych']);
     exit;
 }
+
+$db = new SQLite3($config['DB_PATH']);
+$db->exec('PRAGMA foreign_keys = ON');
+$reference = $data['order_id'] ?? $data['tr_id'] ?? $data['p24_session_id'] ?? '';
+if (!$reference) {
+    shop_log('Brak identyfikatora zamówienia w webhooku', $logFile);
+    http_response_code(400);
+    echo json_encode(['error' => 'Brak reference']);
+    exit;
+}
+
+$stmt = $db->prepare('SELECT o.id, o.external_id, o.player, o.amount, o.currency, o.status, p.command FROM orders o JOIN products p ON p.id = o.product_id WHERE o.external_id = :ext');
+$stmt->bindValue(':ext', $reference, SQLITE3_TEXT);
+$order = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+if (!$order) {
+    shop_log('Webhook dla nieznanego zamówienia: ' . $reference, $logFile);
+    http_response_code(404);
+    echo json_encode(['error' => 'Order not found']);
+    exit;
+}
+
+$creds = decrypt_secret($secrets, $logFile) ?? [];
+$verified = false;
+if ($provider === 'TPAY') {
+    $verified = verify_tpay($data, $creds);
+} elseif ($provider === 'P24' || $provider === 'PRZELEWY24') {
+    $verified = verify_p24($data, $creds);
+}
+
+if (!$verified) {
+    shop_log('Webhook odrzucony — weryfikacja podpisu nie powiodła się dla zamówienia ' . $reference, $logFile);
+    http_response_code(403);
+    echo json_encode(['error' => 'Signature invalid']);
+    exit;
+}
+
+$expectedAmount = (int)round((float)$order['amount'] * 100);
+$receivedAmount = 0;
+if ($provider === 'TPAY') {
+    $receivedAmount = (int)round((float)($data['amount'] ?? 0) * 100);
+} elseif ($provider === 'P24' || $provider === 'PRZELEWY24') {
+    $receivedAmount = (int)($data['p24_amount'] ?? 0);
+}
+if ($expectedAmount && $receivedAmount && $expectedAmount !== $receivedAmount) {
+    shop_log('Webhook odrzucony — kwota niezgodna dla zamówienia ' . $reference, $logFile);
+    http_response_code(409);
+    echo json_encode(['error' => 'Amount mismatch']);
+    exit;
+}
+
+$status = strtoupper($data['status'] ?? $data['tr_status'] ?? $data['p24_status'] ?? '');
+$recognizedPaid = in_array($status, ['PAID', 'SUCCESS', 'CORRECT'], true);
+
+$db->exec('BEGIN IMMEDIATE TRANSACTION');
+$update = $db->prepare('UPDATE orders SET status = :status, payload = :payload, updated_at = datetime("now") WHERE id = :id');
+$update->bindValue(':status', $recognizedPaid ? 'PAID' : $status, SQLITE3_TEXT);
+$update->bindValue(':payload', json_encode($data, JSON_UNESCAPED_UNICODE));
+$update->bindValue(':id', $order['id'], SQLITE3_INTEGER);
+$update->execute();
+$db->exec('COMMIT');
+
+if ($recognizedPaid) {
+    $deliver = $config['DELIVER_SCRIPT'];
+    $command = $order['command'];
+    $player = $order['player'];
+    $args = ' -Player ' . escapeshellarg($player) . ' -CommandTemplate ' . escapeshellarg($command);
+    $output = shell_exec('powershell -NoProfile -ExecutionPolicy Bypass -File ' . escapeshellarg($deliver) . $args);
+    shop_log('Zrealizowano zamówienie ' . $reference . ' dla gracza ' . $player . '. RCON: ' . trim((string)$output), $logFile);
+    http_response_code(200);
+    echo json_encode(['status' => 'DELIVERED']);
+    exit;
+}
+
+shop_log('Webhook przyjęty, status oczekujący: ' . $status . ' (zamówienie ' . $reference . ')', $logFile);
+
 http_response_code(202);
 echo json_encode(['status' => 'ACCEPTED']);
 '@
@@ -692,29 +1068,83 @@ echo json_encode(['status' => 'ACCEPTED']);
 
     $adminPhp = @'
 <?php
+declare(strict_types=1);
 $config = require __DIR__ . '/../config/shop.config.php';
-$creds = json_decode(file_get_contents(__DIR__ . '/../config/admin.credentials.json'), true);
+$secrets = json_decode(file_get_contents($config['SECRETS_PATH']), true);
+$admin = $secrets['Admin'] ?? [];
 $user = $_SERVER['PHP_AUTH_USER'] ?? '';
 $pass = $_SERVER['PHP_AUTH_PW'] ?? '';
 $hash = base64_encode(hash('sha256', $pass, true));
-if (!$user || $user !== $creds['Username'] || $hash !== $creds['PasswordHash']) {
+if (!$user || $user !== ($admin['Username'] ?? '') || $hash !== ($admin['PasswordHash'] ?? '')) {
+
     header('WWW-Authenticate: Basic realm="Shop Admin"');
     header('HTTP/1.0 401 Unauthorized');
     echo 'Unauthorized';
     exit;
 }
-echo '<h1>Panel administracyjny</h1>';
-echo '<p>Dodaj produkty poprzez edycję bazy danych lub przyszły panel.</p>';
+$db = new SQLite3($config['DB_PATH']);
+$orders = $db->query('SELECT external_id, player, amount, currency, status, created_at FROM orders ORDER BY id DESC LIMIT 25');
+$products = $db->query('SELECT id, name, price FROM products ORDER BY id');
+?>
+<!doctype html>
+<html lang="pl">
+<head>
+    <meta charset="utf-8">
+    <title>Panel sklepu</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 2rem; }
+        table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+        th, td { border: 1px solid #ccc; padding: 0.5rem; text-align: left; }
+        h1, h2 { margin-top: 0; }
+        .section { margin-bottom: 2rem; }
+    </style>
+</head>
+<body>
+<h1>Panel administracyjny sklepu</h1>
+<div class="section">
+    <h2>Produkty</h2>
+    <table>
+        <tr><th>ID</th><th>Nazwa</th><th>Cena (PLN)</th></tr>
+        <?php while ($row = $products->fetchArray(SQLITE3_ASSOC)): ?>
+            <tr>
+                <td><?= (int)$row['id']; ?></td>
+                <td><?= htmlspecialchars($row['name']); ?></td>
+                <td><?= number_format((float)$row['price'], 2); ?></td>
+            </tr>
+        <?php endwhile; ?>
+    </table>
+    <p>Dodawaj produkty poleceniem <code>php manage.php products:add</code> (do implementacji) lub ręcznie w SQLite.</p>
+</div>
+<div class="section">
+    <h2>Ostatnie zamówienia</h2>
+    <table>
+        <tr><th>Ref</th><th>Gracz</th><th>Kwota</th><th>Status</th><th>Data</th></tr>
+        <?php while ($row = $orders->fetchArray(SQLITE3_ASSOC)): ?>
+            <tr>
+                <td><code><?= htmlspecialchars($row['external_id']); ?></code></td>
+                <td><?= htmlspecialchars($row['player']); ?></td>
+                <td><?= number_format((float)$row['amount'], 2) . ' ' . htmlspecialchars($row['currency']); ?></td>
+                <td><?= htmlspecialchars($row['status']); ?></td>
+                <td><?= htmlspecialchars($row['created_at']); ?></td>
+            </tr>
+        <?php endwhile; ?>
+    </table>
+</div>
+</body>
+</html>
+
 '@
     $adminPath = Join-Path $paths.ShopAdmin 'index.php'
     $adminPhp | Out-File -FilePath $adminPath -Encoding UTF8
 
     $readme = @'
 === Sklep BLIK – instrukcje sandbox ===
-1. Skonfiguruj klucze PSP w pliku config/shop.config.php lub uruchom C:\Infra\shop\configure-psp.ps1.
-2. Utwórz produkt testowy w SQLite (tabela products) – domyślnie dwa przykładowe produkty.
-3. Użyj środowiska sandbox PSP (TPay/Przelewy24) i ustaw webhook: https://twoj-host/shop/webhook.php.
-4. Po dokonaniu płatności sprawdź logi w C:\Infra\logs oraz konsolę serwera Minecraft.
+1. Uruchom C:\Infra\shop\configure-psp.ps1 i wklej dane merchanta (TPay lub Przelewy24). Sekrety są szyfrowane DPAPI.
+2. W panelu PSP ustaw webhook na adres: https://twoj-host/shop/webhook.php oraz identyfikator zamówienia z formularza sklepu.
+3. Tunele Playit: 443→8443 (HTTPS Caddy), 11131→11131 (Minecraft), 11141→11141 (BlueMap).
+4. Logi sklepu znajdziesz w C:\Infra\logs\shop.log oraz C:\Infra\logs\shop-delivery.log.
+5. W przypadku problemów sprawdź panel admina pod /shop/admin i logi systemowe.
+
 '@
     $readmePath = Join-Path $paths.Shop 'README-FIRST.txt'
     $readme | Out-File -FilePath $readmePath -Encoding UTF8
@@ -722,29 +1152,66 @@ echo '<p>Dodaj produkty poprzez edycję bazy danych lub przyszły panel.</p>';
     $configurePsp = @'
 [CmdletBinding()]
 param()
-$configPath = 'C:\Infra\shop\config\shop.config.php'
-if (-not (Test-Path $configPath)) {
-    Write-Error "Nie znaleziono pliku konfiguracyjnego."; exit 1
+
+function Protect-PlainText {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine))
 }
-$provider = Read-Host "Wybierz dostawcę PSP (TPAY/P24)"
-$apiKey = Read-Host "Wklej API KEY"
-$merchant = Read-Host "Merchant ID"
-$secret = Read-Host "Secret/Tpay Password"
-$rconPassword = Read-Host "Hasło RCON (pozostaw puste aby nie zmieniać)"
 
-$protected = [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Protect([System.Text.Encoding]::UTF8.GetBytes($secret), $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine))
+$secretsPath = 'C:\Infra\shop\config\secrets.json'
+if (-not (Test-Path -LiteralPath $secretsPath)) {
+    Write-Error "Nie znaleziono pliku $secretsPath"; exit 1
+}
+$data = Get-Content -LiteralPath $secretsPath | ConvertFrom-Json
+$provider = (Read-Host "Wybierz dostawcę PSP (TPAY/P24)").ToUpper()
+$payload = [ordered]@{}
+$display = [ordered]@{}
+switch ($provider) {
+    'TPAY' {
+        $payload.merchant_id = Read-Host 'Merchant ID'
+        $payload.api_key = Read-Host 'API key'
+        $payload.secret = Read-Host 'CRC/Secret'
+        $display.merchant_id = $payload.merchant_id
+    }
+    'P24' { $provider = 'P24';
+        $payload.merchant_id = Read-Host 'Merchant ID'
+        $payload.pos_id = Read-Host 'POS ID'
+        $payload.secret = Read-Host 'CRC'
+        $display.merchant_id = $payload.merchant_id
+        $display.pos_id = $payload.pos_id
+    }
+    default {
+        Write-Error 'Nieznany dostawca. Obsługiwani: TPAY, P24.'; exit 1
+    }
+}
 
-$content = "<?php`nreturn [`n    'PSP_PROVIDER' => '" + $provider.ToUpper() + "',`n    'ENCRYPTED_CREDENTIALS' => '" + $protected + "',`n    'API_KEY' => '" + $apiKey + "',`n    'PUBLIC_KEY' => '" + $merchant + "',`n    'PRIVATE_KEY' => '',`n    'RCON_PASSWORD' => '" + $rconPassword + "',`n    'RCON_HOST' => '127.0.0.1',`n    'RCON_PORT' => 25575,`n    'DELIVER_SCRIPT' => 'C:\\Infra\\shop\\bin\\deliver.ps1'`n];"
-$content | Out-File -FilePath $configPath -Encoding UTF8
-Write-Host "Zapisano konfigurację PSP." -ForegroundColor Green
+$json = ($payload | ConvertTo-Json -Depth 4)
+$data.PSP.Provider = $provider
+$data.PSP.EncryptedPayload = Protect-PlainText $json
+$data.PSP.Credentials = $display
+
+$changeRcon = Read-Host 'Czy zaktualizować hasło RCON? (T/N)'
+if ($changeRcon -match '^[TtYy]') {
+    $newRcon = Read-Host 'Nowe hasło RCON'
+    if ($newRcon) {
+        $data.Rcon.EncryptedPassword = Protect-PlainText $newRcon
+        $data.Rcon.UpdatedAt = (Get-Date).ToString('o')
+    }
+}
+
+$data | ConvertTo-Json -Depth 6 | Out-File -FilePath $secretsPath -Encoding UTF8
+Write-Host "Sekrety PSP zapisane." -ForegroundColor Green
+
 '@
     $configurePath = Join-Path $paths.Shop 'configure-psp.ps1'
     $configurePsp | Out-File -FilePath $configurePath -Encoding UTF8
 
     Write-Section "Inicjalizacja bazy SQLite"
     $sqlitePath = Join-Path $paths.ShopData 'shop.sqlite'
-    if (-not (Test-Path -LiteralPath $sqlitePath)) {
-        $schema = @'
+    $schema = @'
+
 CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -753,30 +1220,43 @@ CREATE TABLE IF NOT EXISTS products (
 );
 CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id INTEGER,
-    player TEXT,
-    status TEXT,
-    reference TEXT,
+    external_id TEXT UNIQUE,
+    product_id INTEGER NOT NULL,
+    player TEXT NOT NULL,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'PLN',
+    status TEXT NOT NULL,
+    provider TEXT,
+    payload TEXT,
     created_at TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    FOREIGN KEY(product_id) REFERENCES products(id)
+
 );
 CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message TEXT,
     created_at TEXT
-);
+);CREATE INDEX IF NOT EXISTS idx_orders_external_id ON orders(external_id);
 INSERT OR IGNORE INTO products (id, name, price, command) VALUES (1, 'Diamentowy miecz', 1.00, '/give %player% diamond_sword 1');
 INSERT OR IGNORE INTO products (id, name, price, command) VALUES (2, 'Elytra', 15.00, '/give %player% elytra 1');
 '@
-        $schemaFile = Join-Path $paths.ShopData 'schema.sql'
-        $schema | Out-File -FilePath $schemaFile -Encoding UTF8
-        & $phpExe -r "\$db=new SQLite3('$sqlitePath');\$schema=file_get_contents('$schemaFile');\$db->exec(\$schema);"
-    }
+    $schemaFile = Join-Path $paths.ShopData 'schema.sql'
+    $schema | Out-File -FilePath $schemaFile -Encoding UTF8
+    & $phpExe -r "\$db=new SQLite3('$sqlitePath');\$schema=file_get_contents('$schemaFile');\$db->exec(\$schema);"
+    & $phpExe -r "\$db=new SQLite3('$sqlitePath');\$columns=array();\$result=\$db->query('PRAGMA table_info(orders)');while(\$row=\$result->fetchArray(SQLITE3_ASSOC)){\$columns[] = \$row['name'];}if(!in_array('payload',\$columns,true)){\$db->exec('ALTER TABLE orders ADD COLUMN payload TEXT');}\$result2=\$db->query('PRAGMA table_info(orders)');\$columns2=array();while(\$row2=\$result2->fetchArray(SQLITE3_ASSOC)){\$columns2[] = \$row2['name'];}if(!in_array('provider',\$columns2,true)){\$db->exec('ALTER TABLE orders ADD COLUMN provider TEXT');}\$db->close();"
+
+    Write-Section "Serwer PHP jako usługa"
+    $shopLog = Join-Path $paths.Logs 'shop-service.log'
+    Ensure-NssmService -ServiceName 'ShopPhpService' -DisplayName 'Minecraft Shop Service' -Executable $phpExe -Arguments "-S 127.0.0.1:8081 -t `"$($paths.ShopPublic)`"" -WorkingDirectory $paths.Shop -StdOutLog $shopLog -StdErrLog $shopLog
+    $legacyTask = Get-ScheduledTask -TaskName 'ShopService@Startup' -ErrorAction SilentlyContinue
+    if ($legacyTask) { Unregister-ScheduledTask -TaskName 'ShopService@Startup' -Confirm:$false }
 
     Write-Section "Serwer PHP (php-cgi)"
     $phpLog = Join-Path $paths.Logs 'php-cgi.log'
     $phpArgs = '-b 127.0.0.1:9000 -c "' + $paths.PHP + '"'
     Install-NssmService -NssmExe $nssmExe -ServiceName 'ShopPhpCgi' -DisplayName 'Sklep Minecraft PHP (FastCGI)' -Executable $phpCgiExe -Arguments $phpArgs -WorkingDirectory $paths.ShopPublic -StdOut $phpLog -StdErr $phpLog
+
 
     Write-Section "Konfiguracja RCON serwera Minecraft"
     $serverProps = 'C:\SERWER\server.properties'
@@ -810,6 +1290,15 @@ INSERT OR IGNORE INTO products (id, name, price, command) VALUES (2, 'Elytra', 1
         }
     }
     if ($modified) { $props | Set-Content -Path $serverProps -Encoding UTF8 }
+
+    if ($rconPassword) {
+        $secretsData.Rcon.EncryptedPassword = Protect-Secret -Secret $rconPassword
+        $secretsData.Rcon.UpdatedAt = (Get-Date).ToString('o')
+    }
+    Save-Json -Path $secretsPath -Data $secretsData
+    icacls $secretsPath /inheritance:r | Out-Null
+    icacls $secretsPath /grant:r 'Administrators:F' | Out-Null
+
 
     Write-Section "Autostart serwera Minecraft"
     $startBat = 'C:\SERWER\start-server.bat'
@@ -870,6 +1359,7 @@ cd /d "%SERVER_DIR%"
         Start-Process -FilePath $playitExe -ArgumentList 'device-link'
         Write-Host "Połącz urządzenie w przeglądarce i utwórz tunele." -ForegroundColor Green
     }
+    Write-Host "Docelowe tunele: 443→8443, 11131→11131, 11141→11141." -ForegroundColor Cyan
 
     $playitCommands = @(
         'playit.exe tunnel create tcp --local 127.0.0.1:8443 --remote 0.0.0.0:443 --name "Portal HTTPS"'
@@ -881,6 +1371,12 @@ cd /d "%SERVER_DIR%"
     Write-Host "Lista komend Playit zapisana w $playitHints" -ForegroundColor Green
 
     Write-Section "Zadania i logi"
+    foreach ($logName in @('shop.log','shop-delivery.log','shop-service.log','caddy-service.log')) {
+        $logFilePath = Join-Path $paths.Logs $logName
+        if (-not (Test-Path -LiteralPath $logFilePath)) {
+            New-Item -Path $logFilePath -ItemType File -Force | Out-Null
+        }
+    }
     $logRotateCommand = "Get-ChildItem '$($paths.Logs)' -Filter *.log | ForEach-Object { if ($_.Length -gt 10MB) { for($i=9;$i -ge 1;$i--) { $src = $_.FullName + '.' + $i; $dst = $_.FullName + '.' + ($i + 1); if (Test-Path $src) { Move-Item $src $dst -Force } } $backup = $_.FullName + '.1'; Move-Item $_.FullName $backup -Force } }"
     $logRotateTaskAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -Command `$ErrorActionPreference='Stop'; $logRotateCommand"
     $logRotateTaskTrigger = New-ScheduledTaskTrigger -Daily -At 3am
@@ -894,6 +1390,7 @@ cd /d "%SERVER_DIR%"
             PasswordProtected = if ($adminPass) { Protect-Secret $adminPass } else { '<niezmienione>' }
         }
         RconPasswordProtected = Protect-Secret $rconPassword
+
     }
     Save-Json -Path $secretFile -Data $secrets
     icacls $secretFile /inheritance:r | Out-Null
@@ -916,15 +1413,22 @@ cd /d "%SERVER_DIR%"
 
     Write-Section "Uruchamianie usług"
     $services = @('CaddyReverseProxy','MeshCentral') | ForEach-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue }
+
     foreach ($svc in $services) {
         if ($svc -and $svc.Status -ne 'Running') { Start-Service -Name $svc.Name }
     }
+
+    if (-not $global:MeshAgentInstalled -and -not (Get-Service -Name 'Mesh Agent' -ErrorAction SilentlyContinue)) {
+        Write-Warning 'MeshAgent nie został zainstalowany automatycznie. Pobierz instalator z http://localhost:8080/desk po zalogowaniu.'
+    }
+
 
     Write-Section "Status końcowy"
     $status = [ordered]@{
         Caddy = (Get-Service -Name 'CaddyReverseProxy' -ErrorAction SilentlyContinue)?.Status
         MeshCentral = (Get-Service -Name 'MeshCentral' -ErrorAction SilentlyContinue)?.Status
         ShopPhpCgi = (Get-Service -Name 'ShopPhpCgi' -ErrorAction SilentlyContinue)?.Status
+
         Minecraft = (Get-ScheduledTask -TaskName 'Minecraft@Startup' -ErrorAction SilentlyContinue) ? 'ScheduledTask'
     }
     $status.GetEnumerator() | ForEach-Object { Write-Host ("{0,-12}: {1}" -f $_.Key, $_.Value) }
@@ -955,6 +1459,7 @@ cd /d "%SERVER_DIR%"
     Write-Host "3. Skonfiguruj klucze PSP: C:\Infra\shop\configure-psp.ps1" -ForegroundColor Green
     Write-Host "4. Wykonaj test sandbox BLIK 1 PLN i potwierdź dostarczenie przedmiotu." -ForegroundColor Green
     Write-Host "5. Pamiętaj: certyfikat TLS od Caddy (tls internal) jest self-signed – przeglądarka pokaże ostrzeżenie do czasu podpięcia własnej domeny." -ForegroundColor Yellow
+
 
 }
 catch {
