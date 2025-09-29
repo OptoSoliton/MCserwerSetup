@@ -109,6 +109,7 @@ function Ensure-Service {
     }
 }
 
+
 function Generate-Secret {
     param([int]$Length = 32)
     $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}'
@@ -125,6 +126,7 @@ function Generate-CliSafeSecret {
     ($bytes | ForEach-Object { $chars[ $_ % $chars.Length ] }) -join ''
 }
 
+
 function Protect-Secret {
     param([string]$Secret)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Secret)
@@ -138,6 +140,7 @@ function Save-Json {
     $json = $Data | ConvertTo-Json -Depth 6
     $json | Out-File -FilePath $Path -Encoding UTF8
 }
+
 
 function Ensure-LogRotationConfig {
     param([string]$LogPath)
@@ -383,6 +386,7 @@ try {
 
     Write-Section "Konfiguracja zapory"
     Ensure-FirewallRule -Name 'Allow-Portal-8443' -DisplayName 'Allow Portal HTTPS 8443' -Action Allow -Direction Inbound -LocalPort 8443
+
     Ensure-FirewallRule -Name 'Allow-Minecraft-11131' -DisplayName 'Allow Minecraft 11131' -Action Allow -Direction Inbound -LocalPort 11131
     Ensure-FirewallRule -Name 'Allow-BlueMap-11141' -DisplayName 'Allow BlueMap 11141' -Action Allow -Direction Inbound -LocalPort 11141
     Ensure-FirewallRule -Name 'Block-RDP-3389' -DisplayName 'Block RDP 3389' -Action Block -Direction Inbound -LocalPort 3389
@@ -428,6 +432,7 @@ try {
         try { $deskScriptCheck = Invoke-LocalHttps -Uri 'https://localhost:8443/desk/scripts/common.js' } catch { $deskScriptCheck = $_ }
     }
 
+
     Write-Section "Node.js + MeshCentral"
     $nodeRoot = Join-Path $paths.Bin 'node'
     $nodeExe = Join-Path $nodeRoot 'node.exe'
@@ -441,6 +446,7 @@ try {
         $extracted = Join-Path $paths.Bin 'node-v18.20.2-win-x64'
         if (Test-Path $extracted) {
             if (Test-Path $nodeRoot) { Remove-Item -Recurse -Force $nodeRoot }
+
             Rename-Item -Path $extracted -NewName 'node'
         }
     }
@@ -510,6 +516,7 @@ try {
         Ensure-ScheduledTask -TaskName 'MeshCentral@Startup' -Action $meshAction -Trigger $meshTrigger -Description 'MeshCentral serwer zdalnego pulpitu'
     }
 
+
     Start-Sleep -Seconds 5
 
     $meshAdminAccountPath = Join-Path $paths.Mesh "meshcentral-data\users\$($global:MeshAdminUser).json"
@@ -562,6 +569,7 @@ try {
         $phpZip = Join-Path ([System.IO.Path]::GetTempPath()) 'php.zip'
         Invoke-WebRequest -Uri 'https://windows.php.net/downloads/releases/php-8.3.3-nts-Win32-vs16-x64.zip' -OutFile $phpZip -UseBasicParsing
         Expand-Archive -Path $phpZip -DestinationPath $paths.PHP -Force
+
         Remove-Item -Path $phpZip -Force
     }
     else {
@@ -595,6 +603,7 @@ try {
     if ($iniContent -notmatch 'extension\s*=\s*sqlite3') { $iniContent += 'extension = sqlite3' }
     if ($iniContent -notmatch 'extension\s*=\s*pdo_sqlite') { $iniContent += 'extension = pdo_sqlite' }
     $iniContent | Set-Content -Path $phpIni -Encoding UTF8
+
 
     $configPhp = @'
 <?php
@@ -1063,6 +1072,7 @@ $products = $db->query('SELECT id, name, price FROM products ORDER BY id');
 </div>
 </body>
 </html>
+
 '@
     $adminPath = Join-Path $paths.ShopAdmin 'index.php'
     $adminPhp | Out-File -FilePath $adminPath -Encoding UTF8
@@ -1074,6 +1084,7 @@ $products = $db->query('SELECT id, name, price FROM products ORDER BY id');
 3. Tunele Playit: 443→8443 (HTTPS Caddy), 11131→11131 (Minecraft), 11141→11141 (BlueMap).
 4. Logi sklepu znajdziesz w C:\Infra\logs\shop.log oraz C:\Infra\logs\shop-delivery.log.
 5. W przypadku problemów sprawdź panel admina pod /shop/admin i logi systemowe.
+
 '@
     $readmePath = Join-Path $paths.Shop 'README-FIRST.txt'
     $readme | Out-File -FilePath $readmePath -Encoding UTF8
@@ -1165,6 +1176,7 @@ CREATE TABLE IF NOT EXISTS audit (
     created_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_orders_external_id ON orders(external_id);
+
 INSERT OR IGNORE INTO products (id, name, price, command) VALUES (1, 'Diamentowy miecz', 1.00, '/give %player% diamond_sword 1');
 INSERT OR IGNORE INTO products (id, name, price, command) VALUES (2, 'Elytra', 15.00, '/give %player% elytra 1');
 '@
@@ -1194,6 +1206,7 @@ INSERT OR IGNORE INTO products (id, name, price, command) VALUES (2, 'Elytra', 1
     if (-not (Test-Path -LiteralPath $serverProps)) {
         throw "Nie znaleziono C:\SERWER\server.properties"
     }
+
     $props = Get-Content -Path $serverProps
     $rconPassword = $null
     $modified = $false
@@ -1256,6 +1269,7 @@ cd /d "C:\SERWER"
 "C:\Program Files\Microsoft\jdk-21.0.8.9-hotspot\bin\java.exe" -Xms128M -XX:MaxRAMPercentage=95.0 -Dterminal.jline=false -Dterminal.ansi=true -jar server.jar
 '@ | Out-File -FilePath $startBat -Encoding ASCII
     }
+
     $mcAction = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c "C:\SERWER\start-server.bat"'
     $mcTrigger = New-ScheduledTaskTrigger -AtStartup
     Ensure-ScheduledTask -TaskName 'Minecraft@Startup' -Action $mcAction -Trigger $mcTrigger -Description 'Start serwera Minecraft'
@@ -1312,6 +1326,7 @@ cd /d "C:\SERWER"
 
     Write-Section "Zadania i logi"
     foreach ($logName in @('shop.log','shop-delivery.log','shop-phpcgi.log','caddy-service.log')) {
+
         $logFilePath = Join-Path $paths.Logs $logName
         if (-not (Test-Path -LiteralPath $logFilePath)) {
             New-Item -Path $logFilePath -ItemType File -Force | Out-Null
@@ -1329,6 +1344,7 @@ cd /d "C:\SERWER"
         RconPassword = if ($rconPassword) { $rconPassword } else { '<bez zmian>' }
         MeshCentral = @{ Username = $global:MeshAdminUser; Password = if ($global:MeshAdminPass) { $global:MeshAdminPass } else { '<niezmienione>' } }
         PSPProvider = $secretsData.PSP.Provider
+
     }
     Save-Json -Path $secretFile -Data $secrets
     icacls $secretFile /inheritance:r | Out-Null
@@ -1427,12 +1443,14 @@ cd /d "C:\SERWER"
         Write-Host "[OK] Wszystkie health-checki zakończone powodzeniem." -ForegroundColor DarkGreen
     }
 
+
     Write-Section "Status końcowy"
     $status = [ordered]@{
         Caddy = (Get-Service -Name 'CaddyReverseProxy' -ErrorAction SilentlyContinue)?.Status
         MeshCentral = (Get-Service -Name 'MeshCentral' -ErrorAction SilentlyContinue)?.Status
         ShopService = (Get-Service -Name 'ShopPhpCgi' -ErrorAction SilentlyContinue)?.Status
         MeshAgent = (Get-Service -Name 'Mesh Agent' -ErrorAction SilentlyContinue)?.Status
+
         Minecraft = (Get-ScheduledTask -TaskName 'Minecraft@Startup' -ErrorAction SilentlyContinue) ? 'ScheduledTask'
     }
     $status.GetEnumerator() | ForEach-Object { Write-Host ("{0,-12}: {1}" -f $_.Key, $_.Value) }
