@@ -425,7 +425,16 @@ try {
         Remove-Item -Path $nodeZip -Force
         $extracted = Join-Path $paths.Bin 'node-v18.20.2-win-x64'
         if (Test-Path $extracted) {
-            if (Test-Path $nodeRoot) { Remove-Item -Recurse -Force $nodeRoot }
+            if (Test-Path $nodeRoot) {
+                $timestamp = Get-Date -Format 'yyyyMMddHHmmss'
+                $backupCandidate = "$nodeRoot.backup.$timestamp"
+                while (Test-Path -LiteralPath $backupCandidate) {
+                    $timestamp = Get-Date -Format 'yyyyMMddHHmmssff'
+                    $backupCandidate = "$nodeRoot.backup.$timestamp"
+                }
+                Move-Item -Path $nodeRoot -Destination $backupCandidate -Force
+                Write-Host "[SAFE] Istniejąca kopia Node.js przeniesiona do $backupCandidate" -ForegroundColor Yellow
+            }
             Rename-Item -Path $extracted -NewName 'node'
         }
     }
